@@ -18,13 +18,12 @@ class Settings:
     MAX_UPLOAD_SIZE_BYTES: int = int(os.getenv("MAX_UPLOAD_SIZE_BYTES", str(150 * 1024 * 1024)))
     ALLOWED_EXTENSIONS: Set[str] = {".fits", ".fit", ".fits.gz", ".fit.gz", ".fz"}
     
-    # CORS
+    # CORS: Explicit allowed origins (disallowing wildcard '*' with credentials)
     CORS_ORIGINS: List[str] = [
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "http://localhost:3000",
-        "http://localhost:8000",
-        "*"
+        "http://localhost:8000"
     ]
     
     # IRSA SPHEREx TAP / SIA URLs

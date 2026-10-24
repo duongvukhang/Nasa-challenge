@@ -49,6 +49,8 @@ Thumbs.db
 # Large Raw Datasets & Temporary Uploads
 backend/data/uploads/*
 backend/data/cache/*
+backend/data/tracks.json
+backend/data/tracks.json.tmp
 !backend/data/samples/
 backend/data/samples/*.fits
 !backend/data/samples/demo_*.fits

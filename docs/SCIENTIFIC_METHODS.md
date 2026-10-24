@@ -58,5 +58,5 @@ $$\sigma_{pred}(t) = \sigma_0 + \dot{\sigma} \cdot |t - t_0|$$
 
 ### Explicit Physical Limitations:
 1. **No Keplerian Gravity:** Linear extrapolation assumes constant apparent sky velocity and does not account for gravitational orbital mechanics.
-2. **Parallactic Motion Omitted:** Trans-Neptunian Objects and hypothetical Planet X candidates exhibit substantial annual reflex parallax caused by Earth's orbit around the Sun ($\sim \pm 3600^{\prime\prime} / d_{\text{AU}}$).
+2. **Parallactic Motion Omitted:** Trans-Neptunian Objects and hypothetical Planet X candidates exhibit substantial annual reflex parallax caused by Earth's orbit around the Sun ($p \approx \frac{206265^{\prime\prime}}{d_{\text{AU}}}$ semi-amplitude). Linear extrapolation is valid only over short temporal baselines.
 3. **Validation Role:** Predictions serve as an illustrative baseline to compare against subsequent observations ($\chi_{residual} = \Delta \theta / \sigma_{pred}$).

@@ -2,8 +2,10 @@ import pytest
 import numpy as np
 from app.services.fits_service import fits_service
 from app.services.matching_service import matching_service
+from app.services.source_detection import source_detection_service
 from app.services.sample_generator import create_simulated_spherex_fits
 
+@pytest.mark.synthetic
 def test_cross_epoch_tracking_and_proper_motion(tmp_path):
     """
     Verifies that cross-epoch matching identifies corresponding sources,
@@ -19,10 +21,21 @@ def test_cross_epoch_tracking_and_proper_motion(tmp_path):
     meta1 = fits_service.parse_fits_file(p1, observation_id="track_ep1")
     meta2 = fits_service.parse_fits_file(p2, observation_id="track_ep2")
 
+    # Detect sources in reference observation to get authentic stable source ID
+    obs1 = fits_service.get_observation("track_ep1")
+    srcs1 = source_detection_service.detect_sources(
+        observation_id="track_ep1",
+        data=obs1["data"],
+        astropy_wcs=obs1["wcs"],
+        flag_mask=obs1.get("flags"),
+        bunit=meta1.bunit
+    )
+    assert len(srcs1.sources) > 0
+
     # Run tracking for first detected source
     res = matching_service.track_source_across_observations(
         reference_obs_id="track_ep1",
-        reference_source_id="src_ck_ep1_001",
+        reference_source_id=srcs1.sources[0].id,
         matching_radius_arcsec=15.0,
         observation_ids=["track_ep1", "track_ep2"]
     )
@@ -40,6 +53,7 @@ def test_cross_epoch_tracking_and_proper_motion(tmp_path):
     assert ep2_match.confidence_score > 0.0
     assert ep2_match.confidence_rationale != ""
 
+@pytest.mark.synthetic
 def test_moving_planet_trajectory_and_consistent_tracking(tmp_path):
     """
     Verifies that a high-motion body (planet/asteroid candidate) moving across 3 epochs
@@ -58,10 +72,21 @@ def test_moving_planet_trajectory_and_consistent_tracking(tmp_path):
     fits_service.parse_fits_file(p2, observation_id="planet_ep2")
     fits_service.parse_fits_file(p3, observation_id="planet_ep3")
 
+    obs1 = fits_service.get_observation("planet_ep1")
+    srcs1 = source_detection_service.detect_sources(
+        observation_id="planet_ep1",
+        data=obs1["data"],
+        astropy_wcs=obs1["wcs"],
+        flag_mask=obs1.get("flags"),
+        bunit=obs1["metadata"].bunit
+    )
+    # Moving object in synthetic generator is located near (60.0, 48.0)
+    moving_src1 = min(srcs1.sources, key=lambda s: (s.pixel_x - 60.0)**2 + (s.pixel_y - 48.0)**2)
+
     # Track from epoch 1
     track1 = matching_service.track_source_across_observations(
         reference_obs_id="planet_ep1",
-        reference_source_id="src_et_ep1_005",
+        reference_source_id=moving_src1.id,
         matching_radius_arcsec=10.0,
         observation_ids=["planet_ep1", "planet_ep2", "planet_ep3"]
     )

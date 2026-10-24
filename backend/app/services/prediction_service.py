@@ -9,7 +9,7 @@ from app.schemas.tracking import (
 )
 from app.services.coordinate_service import coordinate_service
 from app.services.fits_service import fits_service
-from app.services.matching_service import matching_service
+from app.services.source_detection import source_detection_service
 
 class PredictionService:
     """
@@ -86,33 +86,79 @@ class PredictionService:
         verification_info = None
         if req.comparison_observation_id:
             comp_record = fits_service.get_observation(req.comparison_observation_id)
-            if comp_record and comp_record["metadata"].mjd_obs is not None:
-                comp_mjd = comp_record["metadata"].mjd_obs
-                dt_comp = comp_mjd - ref_time
+            if not comp_record:
+                raise ValueError(f"Comparison observation '{req.comparison_observation_id}' not found.")
 
-                # Predicted position at comparison epoch
-                pred_ra_comp = (ref_ra + (req.pm_ra_cosdec_arcsec_day * dt_comp) / (3600.0 * cos_dec)) % 360.0
-                pred_dec_comp = max(-90.0, min(90.0, ref_dec + (req.pm_dec_arcsec_day * dt_comp) / 3600.0))
+            comp_meta = comp_record["metadata"]
+            comp_mjd = comp_meta.mjd_obs
+            dt_comp = (comp_mjd - ref_time) if (comp_mjd is not None and ref_time is not None) else 0.0
 
-                # Track against comparison observation
-                track = matching_service.track_source_across_observations(
-                    reference_obs_id=req.reference_observation_id,
-                    reference_source_id="ref_pred",
-                    matching_radius_arcsec=max(5.0, abs(req.pm_ra_cosdec_arcsec_day * dt_comp) + 3.0),
-                    observation_ids=[req.comparison_observation_id]
-                )
+            # Predicted position at comparison epoch
+            pred_ra_comp = (ref_ra + (req.pm_ra_cosdec_arcsec_day * dt_comp) / (3600.0 * cos_dec)) % 360.0
+            pred_dec_comp = max(-90.0, min(90.0, ref_dec + (req.pm_dec_arcsec_day * dt_comp) / 3600.0))
+            expected_unc = base_sigma_arcsec + (sigma_growth_rate * abs(dt_comp))
 
-                if len(track.timeline) > 0:
-                    matched_epoch = track.timeline[0]
-                    if matched_epoch.ra_deg is not None and matched_epoch.dec_deg is not None:
-                        actual_ra = matched_epoch.ra_deg
-                        actual_dec = matched_epoch.dec_deg
+            comp_wcs = comp_record.get("wcs")
+            if not comp_meta.wcs.has_wcs or comp_wcs is None:
+                verification_info = {
+                    "comparison_observation_id": req.comparison_observation_id,
+                    "comparison_mjd": comp_mjd,
+                    "delta_days": round(dt_comp, 3),
+                    "predicted_ra_deg": round(pred_ra_comp, 6),
+                    "predicted_dec_deg": round(pred_dec_comp, 6),
+                    "observed_ra_deg": None,
+                    "observed_dec_deg": None,
+                    "coverage_status": "unknown_coverage",
+                    "angular_residual_arcsec": None,
+                    "residual_sigma": None,
+                    "is_consistent_with_model": False,
+                    "assessment": "Comparison observation lacks valid celestial WCS; coverage cannot be verified."
+                }
+            else:
+                # Project predicted coordinate through actual WCS
+                pix_pos = coordinate_service.sky_to_pixel(comp_wcs, pred_ra_comp, pred_dec_comp)
+                h, w = comp_meta.image_shape
+                if pix_pos is None or pix_pos[0] < 0 or pix_pos[0] >= w or pix_pos[1] < 0 or pix_pos[1] >= h:
+                    verification_info = {
+                        "comparison_observation_id": req.comparison_observation_id,
+                        "comparison_mjd": comp_mjd,
+                        "delta_days": round(dt_comp, 3),
+                        "predicted_ra_deg": round(pred_ra_comp, 6),
+                        "predicted_dec_deg": round(pred_dec_comp, 6),
+                        "observed_ra_deg": None,
+                        "observed_dec_deg": None,
+                        "coverage_status": "outside_coverage",
+                        "angular_residual_arcsec": None,
+                        "residual_sigma": None,
+                        "is_consistent_with_model": False,
+                        "assessment": "Predicted coordinate lies outside the verified geometric footprint of comparison observation."
+                    }
+                else:
+                    # In coverage: search validated detections around predicted position
+                    detect_res = source_detection_service.detect_sources(
+                        observation_id=req.comparison_observation_id,
+                        data=comp_record["data"],
+                        astropy_wcs=comp_wcs,
+                        flag_mask=comp_record.get("flags"),
+                        bunit=comp_meta.bunit
+                    )
 
-                        separation_to_pred = coordinate_service.angular_separation_arcsec(
-                            pred_ra_comp, pred_dec_comp, actual_ra, actual_dec
-                        )
-                        expected_unc = base_sigma_arcsec + (sigma_growth_rate * abs(dt_comp))
-                        residual_sigma = separation_to_pred / expected_unc if expected_unc > 0 else 0.0
+                    search_radius_arcsec = max(5.0, 3.0 * expected_unc)
+                    candidates = []
+                    for src in detect_res.sources:
+                        if src.ra_deg is not None and src.dec_deg is not None:
+                            sep = coordinate_service.angular_separation_arcsec(
+                                pred_ra_comp, pred_dec_comp, src.ra_deg, src.dec_deg
+                            )
+                            if sep <= search_radius_arcsec:
+                                candidates.append((sep, src))
+
+                    if candidates:
+                        candidates.sort(key=lambda c: c[0])
+                        best_sep, best_src = candidates[0]
+                        tgt_unc = float(best_src.position_uncertainty_arcsec or 0.3)
+                        comb_unc = math.hypot(expected_unc, tgt_unc)
+                        res_sigma = best_sep / comb_unc if comb_unc > 0 else 0.0
 
                         verification_info = {
                             "comparison_observation_id": req.comparison_observation_id,
@@ -120,15 +166,31 @@ class PredictionService:
                             "delta_days": round(dt_comp, 3),
                             "predicted_ra_deg": round(pred_ra_comp, 6),
                             "predicted_dec_deg": round(pred_dec_comp, 6),
-                            "observed_ra_deg": round(actual_ra, 6),
-                            "observed_dec_deg": round(actual_dec, 6),
-                            "angular_residual_arcsec": round(separation_to_pred, 3),
-                            "residual_sigma": round(residual_sigma, 2),
-                            "is_consistent_with_model": residual_sigma <= 3.0,
+                            "observed_ra_deg": round(best_src.ra_deg, 6),
+                            "observed_dec_deg": round(best_src.dec_deg, 6),
+                            "coverage_status": "detected",
+                            "angular_residual_arcsec": round(best_sep, 3),
+                            "residual_sigma": round(res_sigma, 2),
+                            "is_consistent_with_model": res_sigma <= 3.0,
                             "assessment": (
-                                f"Observed source is {separation_to_pred:.2f}\" from predicted position ({residual_sigma:.1f}σ). "
-                                f"{'Model is consistent within expected uncertainty.' if residual_sigma <= 3.0 else 'Significant deviation from linear model; orbital curvature, parallax, or mismatched source.'}"
+                                f"Observed candidate detection {best_src.id} is {best_sep:.2f}\" from prediction ({res_sigma:.1f}σ). "
+                                f"{'Consistent with linear motion model.' if res_sigma <= 3.0 else 'Significant deviation from linear model.'}"
                             )
+                        }
+                    else:
+                        verification_info = {
+                            "comparison_observation_id": req.comparison_observation_id,
+                            "comparison_mjd": comp_mjd,
+                            "delta_days": round(dt_comp, 3),
+                            "predicted_ra_deg": round(pred_ra_comp, 6),
+                            "predicted_dec_deg": round(pred_dec_comp, 6),
+                            "observed_ra_deg": None,
+                            "observed_dec_deg": None,
+                            "coverage_status": "no_detection_in_coverage",
+                            "angular_residual_arcsec": None,
+                            "residual_sigma": None,
+                            "is_consistent_with_model": False,
+                            "assessment": f"Target in usable coverage, but no point source detected above threshold within {search_radius_arcsec:.1f}\" search radius."
                         }
 
         return PredictionResponse(

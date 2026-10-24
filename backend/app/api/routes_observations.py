@@ -5,7 +5,16 @@ from app.services.fits_service import fits_service
 from app.services.image_renderer import image_renderer
 from app.services.source_detection import source_detection_service
 from app.services.spectrum_service import spectrum_service, SpectralExtractionResponse
-from app.schemas.observation import ObservationMetadata, SourceListResponse
+from app.services.coordinate_service import coordinate_service
+from app.services.difference_service import difference_service
+from app.schemas.observation import (
+    ObservationMetadata,
+    SourceListResponse,
+    CoordinateProjectionRequest,
+    ProjectionResponse,
+    ProjectedPixel,
+    PixelToWorldResponse
+)
 
 router = APIRouter(prefix="/observations", tags=["Observations"])
 
@@ -102,6 +111,99 @@ def get_spectrum_at_location(
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
+@router.post("/{observation_id}/project", response_model=ProjectionResponse)
+def project_coordinates(observation_id: str, req: CoordinateProjectionRequest):
+    """
+    Transforms a batch of celestial coordinates (RA, Dec) through the observation's
+    celestial WCS into image pixel coordinates and evaluates boundary containment.
+    """
+    obs = fits_service.get_observation(observation_id)
+    if not obs:
+        raise HTTPException(status_code=404, detail=f"Observation '{observation_id}' not found.")
+
+    wcs = obs.get("wcs")
+    meta = obs["metadata"]
+    h, w = meta.image_shape
+
+    if not meta.wcs.has_wcs or wcs is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Observation '{observation_id}' does not possess a valid celestial WCS."
+        )
+
+    projected_list: List[ProjectedPixel] = []
+    for coord in req.coordinates:
+        pix = coordinate_service.sky_to_pixel(wcs, coord.ra_deg, coord.dec_deg)
+        if pix is None:
+            projected_list.append(
+                ProjectedPixel(
+                    ra_deg=coord.ra_deg,
+                    dec_deg=coord.dec_deg,
+                    pixel_x=None,
+                    pixel_y=None,
+                    inside_bounds=False
+                )
+            )
+        else:
+            px, py = pix
+            inside = (0.0 <= px < float(w)) and (0.0 <= py < float(h))
+            projected_list.append(
+                ProjectedPixel(
+                    ra_deg=coord.ra_deg,
+                    dec_deg=coord.dec_deg,
+                    pixel_x=round(float(px), 3),
+                    pixel_y=round(float(py), 3),
+                    inside_bounds=inside
+                )
+            )
+
+    return ProjectionResponse(
+        observation_id=observation_id,
+        has_wcs=True,
+        image_shape=[h, w],
+        projected=projected_list
+    )
+
+@router.get("/{observation_id}/pixel-to-world", response_model=PixelToWorldResponse)
+def pixel_to_world_readout(
+    observation_id: str,
+    pixel_x: float = Query(..., description="0-indexed X pixel coordinate"),
+    pixel_y: float = Query(..., description="0-indexed Y pixel coordinate")
+):
+    """
+    Transforms 0-indexed pixel coordinates to celestial RA, Dec (J2000) and
+    calculates per-pixel wavelength and bandwidth using calibration tables.
+    """
+    obs = fits_service.get_observation(observation_id)
+    if not obs:
+        raise HTTPException(status_code=404, detail=f"Observation '{observation_id}' not found.")
+
+    wcs = obs.get("wcs")
+    meta = obs["metadata"]
+    h, w = meta.image_shape
+    inside = (0.0 <= pixel_x < float(w)) and (0.0 <= pixel_y < float(h))
+
+    ra_val, dec_val = None, None
+    if meta.wcs.has_wcs and wcs is not None:
+        sky = coordinate_service.pixel_to_sky(wcs, pixel_x, pixel_y)
+        if sky:
+            ra_val = round(sky[0], 6)
+            dec_val = round(sky[1], 6)
+
+    w_um, b_um, is_cal = spectrum_service.compute_pixel_wavelength_and_bandwidth(obs, pixel_x, pixel_y)
+
+    return PixelToWorldResponse(
+        observation_id=observation_id,
+        pixel_x=pixel_x,
+        pixel_y=pixel_y,
+        ra_deg=ra_val,
+        dec_deg=dec_val,
+        inside_bounds=inside,
+        wavelength_um=w_um,
+        bandwidth_um=b_um,
+        wavelength_calibrated=is_cal
+    )
+
 @router.delete("/{observation_id}")
 def delete_observation(observation_id: str):
     """
@@ -119,4 +221,42 @@ def clear_all_observations():
     """
     count = fits_service.clear_all_observations()
     return {"status": "cleared", "total_removed": count}
+
+@router.get("/{observation_id}/difference")
+def get_observation_difference(
+    observation_id: str,
+    ref_obs_id: str = Query(..., description="Reference observation ID for subtraction")
+):
+    """
+    Evaluates compatibility and computes scientific difference imaging statistics.
+    Checks footprint overlap, matching spectral channels, and surface brightness units.
+    """
+    result = difference_service.get_difference(observation_id, ref_obs_id)
+    safe_res = {k: v for k, v in result.items() if k != "_diff_array"}
+    return safe_res
+
+@router.get("/{observation_id}/difference-image")
+def get_rendered_difference_image(
+    observation_id: str,
+    ref_obs_id: str = Query(..., description="Reference observation ID for subtraction"),
+    colormap: str = Query("coolwarm", description="Diverging colormap: 'coolwarm', 'RdBu_r', 'gray'"),
+    p_min: float = Query(1.0, ge=0.0, le=20.0),
+    p_max: float = Query(99.0, ge=80.0, le=100.0),
+    max_dim: Optional[int] = Query(1200, description="Max dimension for display preview")
+):
+    """
+    Renders display-ready PNG image of the WCS-reprojected difference array.
+    """
+    try:
+        png_bytes = difference_service.render_difference_png(
+            target_obs_id=observation_id,
+            ref_obs_id=ref_obs_id,
+            colormap=colormap,
+            p_min=p_min,
+            p_max=p_max,
+            max_dim=max_dim or 1200
+        )
+        return Response(content=png_bytes, media_type="image/png")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 

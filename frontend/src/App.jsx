@@ -137,9 +137,7 @@ export const App = () => {
 
         // Ignore if another task superseded
         if (currentTaskId === trackingTaskIdRef.current) {
-          // 6. When tracking finishes, restore user interface to starting epoch E0
-          setActiveObservationId(startingEpochId);
-
+          // Preserve user active epoch without resetting to E0
           setTracks((prev) => ({
             ...prev,
             [track.track_id]: track
@@ -291,13 +289,9 @@ export const App = () => {
         pixelX: src.pixel_x,
         pixelY: src.pixel_y
       };
-
-      // Automatically launch multi-epoch tracking task across loaded epochs
-      if (activeObservationId && observations.length > 1 && !src.is_tracked_target) {
-        handleTrackSource(src);
-      }
+      // Explicit user action required to track across epochs (via 'Track Across Epochs' button)
     },
-    [activeObservationId, observations.length, handleTrackSource]
+    [activeObservationId]
   );
 
   // Switch observation epoch WITHOUT resetting the user's selected object or track data
@@ -471,16 +465,6 @@ export const App = () => {
       }
     }
   }, [trackData, activeObservationId, sources, selectedSource?.id]);
-
-  // Re-track if user explicitly selected a source and trackData is missing
-  useEffect(() => {
-    if (activeObservationId && selectedSource && !selectedSource.is_tracked_target && observations.length > 1 && !trackData) {
-      api
-        .trackSource(activeObservationId, selectedSource.id, 45.0)
-        .then((res) => setTrackData(res))
-        .catch(() => {});
-    }
-  }, [activeObservationId, selectedSource?.id, observations.length, trackData]);
 
   // Action handlers
   const handleUploadFits = async (file) => {
@@ -738,6 +722,11 @@ export const App = () => {
         }}
         onDeleteTrack={handleDeleteTrack}
         onSelectObservation={handleSelectObservation}
+        onUpdateTrack={(updated) => {
+          setTracks((prev) => ({ ...prev, [updated.track_id]: updated }));
+          setInspectingTrack(updated);
+          if (activeTrackId === updated.track_id) setTrackData(updated);
+        }}
       />
 
       {/* 9. Historical Sky-Coordinate Plot Modal */}
@@ -776,6 +765,7 @@ export const App = () => {
         onClose={() => setIsPredictionModalOpen(false)}
         currentObservation={currentObs}
         selectedSource={selectedSource}
+        activeTrack={activeTrackId ? tracks[activeTrackId] : null}
         allObservations={observations}
         onPredictionComputed={(pred) => setPredictionData(pred)}
       />
