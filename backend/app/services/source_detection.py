@@ -1,3 +1,4 @@
+import hashlib
 import numpy as np
 from typing import List, Optional, Dict, Any, Tuple
 from astropy.stats import sigma_clipped_stats, SigmaClip
@@ -12,7 +13,23 @@ class SourceDetectionService:
     """
     Detects candidate astronomical sources from 2D scientific FITS arrays
     using photutils, handles background estimation, masking, and astrometric transformation.
+    Caches detections by observation and parameter configuration.
     """
+    def __init__(self):
+        self._cache: Dict[str, SourceListResponse] = {}
+
+    def clear_cache(self):
+        self._cache.clear()
+
+    @staticmethod
+    def generate_stable_source_id(obs_id: str, px: float, py: float) -> str:
+        """
+        Generates deterministic source ID based on verified product ID and quantized position.
+        Does not depend on detection order or flux rank.
+        """
+        loc_key = f"{obs_id}_{round(px, 1)}_{round(py, 1)}"
+        digest = hashlib.md5(loc_key.encode("utf-8")).hexdigest()[:8]
+        return f"src_{digest}_{int(round(px))}_{int(round(py))}"
 
     def detect_sources(
         self,
@@ -28,6 +45,10 @@ class SourceDetectionService:
         """
         Executes robust point source detection with local background estimation.
         """
+        cache_key = f"{observation_id}_{threshold_sigma}_{fwhm_pixels}_{max_sources}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
         arr = np.array(data, dtype=np.float64, copy=True)
         finite_mask = np.isfinite(arr)
 
@@ -134,10 +155,11 @@ class SourceDetectionService:
 
                     ra_val = float(ra_coords[i]) if ra_coords[i] is not None else None
                     dec_val = float(dec_coords[i]) if dec_coords[i] is not None else None
+                    stable_id = self.generate_stable_source_id(observation_id, float(x_coords[i]), float(y_coords[i]))
 
                     detected_list.append(
                         DetectedSource(
-                            id=f"src_{observation_id[-6:]}_{i+1:03d}",
+                            id=stable_id,
                             pixel_x=round(float(x_coords[i]), 2),
                             pixel_y=round(float(y_coords[i]), 2),
                             ra_deg=round(ra_val, 6) if ra_val is not None else None,
@@ -176,7 +198,7 @@ class SourceDetectionService:
 
                         detected_list.append(
                             DetectedSource(
-                                id=f"src_pk_{observation_id[-6:]}_{i+1:03d}",
+                                id=self.generate_stable_source_id(observation_id, px, py),
                                 pixel_x=round(px, 2),
                                 pixel_y=round(py, 2),
                                 ra_deg=round(ra_val, 6) if ra_val is not None else None,
@@ -195,12 +217,14 @@ class SourceDetectionService:
             except Exception:
                 pass
 
-        return SourceListResponse(
+        result = SourceListResponse(
             observation_id=observation_id,
             detection_method="Photutils DAOStarFinder (Background2D local estimation)",
             total_sources=len(detected_list),
             threshold_sigma=threshold_sigma,
             sources=detected_list
         )
+        self._cache[cache_key] = result
+        return result
 
 source_detection_service = SourceDetectionService()

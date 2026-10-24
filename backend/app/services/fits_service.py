@@ -192,6 +192,22 @@ class FITSService:
                     if flg_arr.ndim == raw_data.ndim and flg_arr.shape == raw_data.shape:
                         flag_data = flg_arr
 
+                # Extract WCS-WAVE extension if present
+                wave_data = None
+                if "WCS-WAVE" in hdul:
+                    try:
+                        whdu = hdul["WCS-WAVE"]
+                        x_pts = np.array(whdu.data["X"][0], dtype=np.float64)
+                        y_pts = np.array(whdu.data["Y"][0], dtype=np.float64)
+                        vals = np.array(whdu.data["VALUES"][0], dtype=np.float64)
+                        wave_data = {
+                            "x": x_pts,
+                            "y": y_pts,
+                            "values": vals
+                        }
+                    except Exception as we:
+                        warnings.append(f"Failed to parse WCS-WAVE table: {we}")
+
         except Exception as e:
             if isinstance(e, FITSParsingError):
                 raise
@@ -292,6 +308,7 @@ class FITSService:
             science_hdu_name=science_hdu_name,
             has_variance_extension=(variance_data is not None),
             has_flag_extension=(flag_data is not None),
+            has_wave_table=(wave_data is not None),
             hdus=hdus_info,
             wcs=wcs_info,
             stats=stats,
@@ -307,6 +324,7 @@ class FITSService:
             "header": header,
             "variance": variance_data,
             "flags": flag_data,
+            "wave_table": wave_data,
             "filepath": filepath
         }
 

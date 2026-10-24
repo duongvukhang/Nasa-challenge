@@ -1,12 +1,13 @@
 import numpy as np
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from pydantic import BaseModel, Field
 
 from app.services.fits_service import fits_service
 from app.services.coordinate_service import coordinate_service
 
 class SpectralPoint(BaseModel):
-    wavelength_um: float
+    wavelength_um: Optional[float] = None
+    bandwidth_um: Optional[float] = None
     flux: float
     flux_error: Optional[float] = None
     flux_unit: str = "MJy/sr"
@@ -16,6 +17,7 @@ class SpectralPoint(BaseModel):
     pixel_x: float
     pixel_y: float
     is_valid: bool = True
+    is_calibrated: bool = False
 
 class SpectralExtractionResponse(BaseModel):
     target_ra_deg: Optional[float] = None
@@ -27,46 +29,71 @@ class SpectralExtractionResponse(BaseModel):
 
 class SpectrumService:
     """
-    Extracts calibrated infrared spectrophotometry for a celestial position
-    across available SPHEREx observations.
+    Extracts infrared spectrophotometry for a celestial position
+    across available SPHEREx observations using verified calibration lookup tables (WCS-WAVE).
     """
 
-    # SPHEREx LVF nominal wavelength ranges (microns)
-    BAND_RANGES = {
-        "LVF1": (0.75, 1.11),
-        "SPHEREX-D1": (0.75, 1.11),
-        "D1": (0.75, 1.11),
-        "LVF2": (1.11, 1.64),
-        "SPHEREX-D2": (1.11, 1.64),
-        "D2": (1.11, 1.64),
-        "LVF3": (1.64, 2.42),
-        "SPHEREX-D3": (1.64, 2.42),
-        "D3": (1.64, 2.42),
-        "LVF4": (2.42, 3.82),
-        "SPHEREX-D4": (2.42, 3.82),
-        "D4": (2.42, 3.82),
-        "LVF5": (3.82, 4.42),
-        "SPHEREX-D5": (3.82, 4.42),
-        "D5": (3.82, 4.42),
-        "LVF6": (4.42, 5.00),
-        "SPHEREX-D6": (4.42, 5.00),
-        "D6": (4.42, 5.00),
+    # SPHEREx LVF nominal wavelength ranges (microns) for reference/synthetic fallback only
+    NOMINAL_BAND_RANGES = {
+        "LVF1": (0.75, 1.11, 0.93),
+        "D1": (0.75, 1.11, 0.93),
+        "LVF2": (1.11, 1.64, 1.375),
+        "D2": (1.11, 1.64, 1.375),
+        "LVF3": (1.64, 2.42, 2.03),
+        "D3": (1.64, 2.42, 2.03),
+        "LVF4": (2.42, 3.82, 3.12),
+        "D4": (2.42, 3.82, 3.12),
+        "LVF5": (3.82, 4.42, 4.12),
+        "D5": (3.82, 4.42, 4.12),
+        "LVF6": (4.42, 5.00, 4.71),
+        "D6": (4.42, 5.00, 4.71),
     }
 
-    def compute_lvf_pixel_wavelength(self, band: Optional[str], pixel_x: float, width: int) -> float:
+    def compute_pixel_wavelength_and_bandwidth(
+        self,
+        obs_record: Dict[str, Any],
+        pixel_x: float,
+        pixel_y: float
+    ) -> Tuple[Optional[float], Optional[float], bool]:
         """
-        Calculates local wavelength under the Linear Variable Filter
-        along detector dispersion axis.
+        Calculates calibrated wavelength and bandwidth from WCS-WAVE tabular lookup.
+        If calibration table is absent, returns (None, None, False) or approximate synthetic flag.
         """
-        band_key = (band or "LVF1").upper()
-        w_min, w_max = (0.75, 1.11)
-        for k, (mn, mx) in self.BAND_RANGES.items():
-            if k in band_key:
-                w_min, w_max = mn, mx
-                break
+        wave_table = obs_record.get("wave_table")
+        if wave_table is not None:
+            try:
+                from scipy.interpolate import RegularGridInterpolator
+                x_pts = wave_table["x"]
+                y_pts = wave_table["y"]
+                vals = wave_table["values"]
 
-        frac = max(0.0, min(1.0, pixel_x / max(1, width - 1)))
-        return round(float(w_min + frac * (w_max - w_min)), 4)
+                interp_wave = RegularGridInterpolator((y_pts, x_pts), vals[:, :, 0], bounds_error=False, fill_value=None)
+                interp_band = RegularGridInterpolator((y_pts, x_pts), vals[:, :, 1], bounds_error=False, fill_value=None)
+
+                # Convert 0-indexed pixel coordinates to 1-indexed FITS control points
+                fits_x = pixel_x + 1.0
+                fits_y = pixel_y + 1.0
+
+                w_val = float(interp_wave([fits_y, fits_x])[0])
+                b_val = float(interp_band([fits_y, fits_x])[0])
+
+                if np.isfinite(w_val) and np.isfinite(b_val):
+                    return round(w_val, 4), round(b_val, 4), True
+            except Exception:
+                pass
+
+        # If synthetic demo, report approximate nominal wavelength clearly flagged as uncalibrated
+        meta = obs_record.get("metadata")
+        if meta and meta.is_synthetic_demo:
+            b_key = (meta.band or "LVF1").upper()
+            for k, (mn, mx, ctr) in self.NOMINAL_BAND_RANGES.items():
+                if k in b_key:
+                    frac = max(0.0, min(1.0, pixel_x / max(1.0, meta.image_shape[1] - 1)))
+                    approx_w = round(mn + frac * (mx - mn), 4)
+                    approx_b = round((mx - mn) / 16.0, 4)
+                    return approx_w, approx_b, False
+
+        return None, None, False
 
     def extract_spectrum(
         self,
@@ -114,19 +141,21 @@ class SpectrumService:
             if var is not None and np.isfinite(var[iy, ix]):
                 err = round(float(np.sqrt(max(0.0, var[iy, ix]))), 4)
 
-            w_um = self.compute_lvf_pixel_wavelength(meta.band, target_px, w)
+            w_um, b_um, is_cal = self.compute_pixel_wavelength_and_bandwidth(obs_record, target_px, target_py)
             points.append(
                 SpectralPoint(
                     wavelength_um=w_um,
+                    bandwidth_um=b_um,
                     flux=round(val, 4) if np.isfinite(val) else 0.0,
                     flux_error=err,
                     flux_unit=meta.bunit,
-                    band=meta.band or "LVF1",
+                    band=meta.band or "LVF",
                     observation_id=meta.observation_id,
                     date_obs=meta.date_obs,
                     pixel_x=round(target_px, 1),
                     pixel_y=round(target_py, 1),
-                    is_valid=bool(np.isfinite(val))
+                    is_valid=bool(np.isfinite(val)),
+                    is_calibrated=is_cal
                 )
             )
 
@@ -153,10 +182,11 @@ class SpectrumService:
                     if ovar is not None and np.isfinite(ovar[oiy, oix]):
                         oerr = round(float(np.sqrt(max(0.0, ovar[oiy, oix]))), 4)
 
-                    ow_um = self.compute_lvf_pixel_wavelength(other_meta.band, opx, ow)
+                    ow_um, ob_um, o_cal = self.compute_pixel_wavelength_and_bandwidth(other_rec, opx, opy)
                     points.append(
                         SpectralPoint(
                             wavelength_um=ow_um,
+                            bandwidth_um=ob_um,
                             flux=round(oval, 4) if np.isfinite(oval) else 0.0,
                             flux_error=oerr,
                             flux_unit=other_meta.bunit,
@@ -165,24 +195,25 @@ class SpectrumService:
                             date_obs=other_meta.date_obs,
                             pixel_x=round(opx, 1),
                             pixel_y=round(opy, 1),
-                            is_valid=bool(np.isfinite(oval))
+                            is_valid=bool(np.isfinite(oval)),
+                            is_calibrated=o_cal
                         )
                     )
 
-        # Sort points by wavelength ascending
-        points.sort(key=lambda p: p.wavelength_um)
+        # Sort points by wavelength ascending (placing None at end)
+        points.sort(key=lambda p: (p.wavelength_um is None, p.wavelength_um or 0.0))
 
         method_text = (
-            "Extracted spectrophotometric measurements from SPHEREx Linear Variable Filter (LVF) calibrated images. "
-            "Wavelength is mapped according to the detector dispersion axis position. When multiple observations of the target "
-            "sky position exist across distinct LVF bands or dither pointings, measurements are synthesized into an infrared Spectral Energy Distribution (SED)."
+            "Extracted spectrophotometric measurements from SPHEREx observations. "
+            "Wavelength and channel bandwidth are derived from verified calibration lookup tables (WCS-WAVE). "
+            "When calibration is absent, values are explicitly reported as uncalibrated or unavailable."
         )
 
         notes = [
             "Measurements represent surface brightness at the source pixel coordinates.",
-            "SPHEREx detectors use Linear Variable Filters where wavelength varies continuously across each focal plane array.",
-            "Wavelength values are derived from published instrument filter specifications and detector dispersion geometries.",
-            "Spectral features should be confirmed with full spectrophotometric aperture extraction."
+            "Wavelength and bandwidth values are calibrated using bivariate lookup from HDU 6 (WCS-WAVE) where present.",
+            "SPHEREx detectors use Linear Variable Filters where wavelength varies across each focal plane array.",
+            "Values from simulated demonstrations are approximations labeled as uncalibrated."
         ]
 
         return SpectralExtractionResponse(

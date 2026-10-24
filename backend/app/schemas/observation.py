@@ -46,6 +46,7 @@ class ObservationMetadata(BaseModel):
     science_hdu_name: str
     has_variance_extension: bool = False
     has_flag_extension: bool = False
+    has_wave_table: bool = False
     hdus: List[HDUInfo] = []
     wcs: WCSInfo
     stats: ImageStats
@@ -75,3 +76,34 @@ class SourceListResponse(BaseModel):
     total_sources: int
     threshold_sigma: float
     sources: List[DetectedSource]
+
+class SkyCoordinateItem(BaseModel):
+    ra_deg: float = Field(..., ge=0.0, le=360.0, description="Right Ascension in degrees [0, 360]")
+    dec_deg: float = Field(..., ge=-90.0, le=90.0, description="Declination in degrees [-90, +90]")
+
+class CoordinateProjectionRequest(BaseModel):
+    coordinates: List[SkyCoordinateItem]
+
+class ProjectedPixel(BaseModel):
+    ra_deg: float
+    dec_deg: float
+    pixel_x: Optional[float] = None
+    pixel_y: Optional[float] = None
+    inside_bounds: bool = False
+
+class ProjectionResponse(BaseModel):
+    observation_id: str
+    has_wcs: bool
+    image_shape: List[int]
+    projected: List[ProjectedPixel]
+
+class PixelToWorldResponse(BaseModel):
+    observation_id: str
+    pixel_x: float
+    pixel_y: float
+    ra_deg: Optional[float] = None
+    dec_deg: Optional[float] = None
+    inside_bounds: bool = False
+    wavelength_um: Optional[float] = None
+    bandwidth_um: Optional[float] = None
+    wavelength_calibrated: bool = False

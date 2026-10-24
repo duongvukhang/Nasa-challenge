@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import {
   Play,
   Pause,
@@ -20,8 +20,10 @@ export const TimeController = ({
   const [speed, setSpeed] = useState(1.0); // seconds per epoch
   const timerRef = useRef(null);
 
-  // Chronologically sorted observations by MJD
-  const sortedObs = [...observations].sort((a, b) => (a.mjd_obs || 0) - (b.mjd_obs || 0));
+  // Chronologically sorted observations by MJD (memoized to prevent timer reset)
+  const sortedObs = useMemo(() => {
+    return [...observations].sort((a, b) => (a.mjd_obs || 0) - (b.mjd_obs || 0));
+  }, [observations]);
   const currentIndex = sortedObs.findIndex((o) => o.observation_id === activeObservationId);
   const safeIndex = currentIndex >= 0 ? currentIndex : 0;
   const activeObs = sortedObs[safeIndex];

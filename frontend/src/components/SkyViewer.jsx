@@ -55,6 +55,8 @@ export const SkyViewer = ({
 
   // Dynamic cursor celestial coordinate readout
   const [cursorPos, setCursorPos] = useState(null);
+  const hoverDebounceRef = useRef(null);
+  const [projectedCoordsMap, setProjectedCoordsMap] = useState({});
 
   // Reset view to center and fit
   const handleResetView = useCallback(() => {
@@ -125,6 +127,23 @@ export const SkyViewer = ({
         }
 
         setCursorPos({ px, py, ra, dec });
+
+        // Debounced exact Astropy WCS readout from backend
+        if (observation.wcs?.has_wcs) {
+          if (hoverDebounceRef.current) clearTimeout(hoverDebounceRef.current);
+          hoverDebounceRef.current = setTimeout(() => {
+            api
+              .pixelToWorld(observation.observation_id, px, py)
+              .then((res) => {
+                if (res?.ra_deg != null && res?.dec_deg != null) {
+                  setCursorPos((prev) =>
+                    prev ? { ...prev, ra: res.ra_deg, dec: res.dec_deg, wavelength_um: res.wavelength_um } : null
+                  );
+                }
+              })
+              .catch(() => {});
+          }, 150);
+        }
       } else {
         setCursorPos(null);
       }
@@ -153,10 +172,67 @@ export const SkyViewer = ({
 
   const [imgH, imgW] = observation.image_shape || [2048, 2048];
 
+  // Compile all active tracks (supporting multiple simultaneous tracks)
+  const allTrackList = Object.values(tracks).length > 0
+    ? Object.values(tracks)
+    : (trackData ? [trackData] : []);
+
+  const visibleTrackList = allTrackList.filter((tr) => tr && !hiddenTrackIds.has(tr.track_id));
+
+  // Batch project all celestial coordinates via backend Astropy WCS
+  useEffect(() => {
+    if (!observation?.observation_id || !observation?.wcs?.has_wcs) return;
+
+    const coordsToProject = [];
+    visibleTrackList.forEach((tr) => {
+      tr?.timeline?.forEach((ep) => {
+        if (ep.ra_deg != null && ep.dec_deg != null) {
+          coordsToProject.push({ ra_deg: ep.ra_deg, dec_deg: ep.dec_deg });
+        }
+      });
+    });
+    predictionData?.trajectory_points?.forEach((pt) => {
+      if (pt.ra_deg != null && pt.dec_deg != null) {
+        coordsToProject.push({ ra_deg: pt.ra_deg, dec_deg: pt.dec_deg });
+      }
+    });
+
+    if (coordsToProject.length === 0) return;
+
+    let isSubscribed = true;
+    api
+      .projectCoordinates(observation.observation_id, coordsToProject)
+      .then((res) => {
+        if (!isSubscribed || !res?.projected) return;
+        const mapping = {};
+        res.projected.forEach((p) => {
+          const key = `${p.ra_deg.toFixed(6)},${p.dec_deg.toFixed(6)}`;
+          mapping[key] = {
+            x: p.pixel_x,
+            y: imgH - p.pixel_y,
+            inside: p.inside_bounds
+          };
+        });
+        setProjectedCoordsMap((prev) => ({ ...prev, ...mapping }));
+      })
+      .catch(() => {});
+
+    return () => {
+      isSubscribed = false;
+    };
+  }, [observation?.observation_id, visibleTrackList, predictionData, imgH]);
+
   // Helper to accurately project celestial coordinates or epoch pixel positions
   // into the CURRENT displayed observation's SVG pixel space.
   const getEpochScreenCoords = (ep) => {
     if (!ep) return null;
+
+    if (ep.ra_deg != null && ep.dec_deg != null) {
+      const key = `${ep.ra_deg.toFixed(6)},${ep.dec_deg.toFixed(6)}`;
+      if (projectedCoordsMap[key]) {
+        return projectedCoordsMap[key];
+      }
+    }
 
     if (
       ep.ra_deg != null &&
@@ -180,13 +256,6 @@ export const SkyViewer = ({
 
     return null;
   };
-
-  // Compile all active tracks (supporting multiple simultaneous tracks)
-  const allTrackList = Object.values(tracks).length > 0
-    ? Object.values(tracks)
-    : (trackData ? [trackData] : []);
-
-  const visibleTrackList = allTrackList.filter((tr) => tr && !hiddenTrackIds.has(tr.track_id));
 
   const imageUrl = api.getImageUrl(observation.observation_id, {
     stretch: displaySettings.stretch || "asinh",

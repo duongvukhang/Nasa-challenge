@@ -103,6 +103,64 @@ export const api = {
     return res.json();
   },
 
+  async undoTrack(trackId) {
+    const res = await fetch(`${API_BASE}/api/tracking/tracks/${trackId}/undo`, { method: "POST" });
+    if (!res.ok) throw new Error(`Failed to undo action on track ${trackId}`);
+    return res.json();
+  },
+
+  async redoTrack(trackId) {
+    const res = await fetch(`${API_BASE}/api/tracking/tracks/${trackId}/redo`, { method: "POST" });
+    if (!res.ok) throw new Error(`Failed to redo action on track ${trackId}`);
+    return res.json();
+  },
+
+  async acceptCandidate(trackId, observationId, candidateSourceId) {
+    const res = await fetch(`${API_BASE}/api/tracking/tracks/${trackId}/accept`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ observation_id: observationId, candidate_source_id: candidateSourceId })
+    });
+    if (!res.ok) throw new Error(`Failed to accept candidate match`);
+    return res.json();
+  },
+
+  getTrackExportUrl(trackId, format = "json") {
+    return `${API_BASE}/api/tracking/tracks/${trackId}/export?format=${format}`;
+  },
+
+  async projectCoordinates(obsId, coordinates) {
+    const res = await fetch(`${API_BASE}/api/observations/${obsId}/project`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ coordinates })
+    });
+    if (!res.ok) throw new Error(`Coordinate projection failed`);
+    return res.json();
+  },
+
+  async pixelToWorld(obsId, pixelX, pixelY) {
+    const res = await fetch(`${API_BASE}/api/observations/${obsId}/pixel-to-world?pixel_x=${pixelX}&pixel_y=${pixelY}`);
+    if (!res.ok) throw new Error(`Pixel to world transformation failed`);
+    return res.json();
+  },
+
+  async getDifference(obsId, refObsId) {
+    const res = await fetch(`${API_BASE}/api/observations/${obsId}/difference?ref_obs_id=${refObsId}`);
+    if (!res.ok) throw new Error(`Difference calculation failed`);
+    return res.json();
+  },
+
+  getDifferenceImageUrl(obsId, refObsId, options = {}) {
+    const params = new URLSearchParams();
+    params.append("ref_obs_id", refObsId);
+    if (options.colormap) params.append("colormap", options.colormap);
+    if (options.p_min !== undefined) params.append("p_min", options.p_min.toString());
+    if (options.p_max !== undefined) params.append("p_max", options.p_max.toString());
+    if (options.max_dim !== undefined) params.append("max_dim", options.max_dim.toString());
+    return `${API_BASE}/api/observations/${obsId}/difference-image?${params.toString()}`;
+  },
+
   async extractSpectrum(obsId, location = {}) {
     const query = new URLSearchParams();
     if (location.pixel_x !== undefined) query.append("pixel_x", location.pixel_x.toString());
