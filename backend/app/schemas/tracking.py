@@ -44,22 +44,33 @@ class MatchedEpoch(BaseModel):
     status: MatchStatus
     matched_source_id: Optional[str] = Field(None, description="Identifier of the matched source in target observation")
     candidate_count: int = Field(0, description="Number of candidate sources within search radius")
+    competing_candidates: Optional[List[Dict[str, Any]]] = Field(None, description="List of competing candidate sources if ambiguous")
     confidence_score: float = Field(..., description="Documented heuristic score between 0.0 and 1.0 (not a calibrated probability)")
     confidence_rationale: str = Field(..., description="Plain-language scientific explanation of the score")
     position_uncertainty_arcsec: float = Field(0.5, description="Positional 1-sigma error ellipse radius")
     is_measured: bool = Field(False, description="True only if supported by real detection in this epoch")
+    photometry_status: Optional[str] = Field(None, description="'measured', 'forced_aperture', 'upper_limit', or 'unavailable'")
+    flux_uncertainty: Optional[float] = Field(None, description="1-sigma uncertainty on flux measurement")
+    upper_limit_3sigma: Optional[float] = Field(None, description="3-sigma flux upper limit if not detected above threshold")
 
 class TrajectoryFitInfo(BaseModel):
     fit_model: FitModelType
     is_verified_motion: bool = Field(False, description="Strictly False if fewer than 3 suitable epochs")
     proper_motion_mas_yr: Optional[float] = Field(None, description="Apparent velocity in milliarcsec/year")
     proper_motion_uncertainty_mas_yr: Optional[float] = Field(None, description="1-sigma uncertainty on apparent velocity")
+    rate_arcsec_day: Optional[float] = Field(None, description="Apparent motion rate in arcsec/day")
+    rate_arcsec_hour: Optional[float] = Field(None, description="Apparent motion rate in arcsec/hour")
+    velocity_significance_sigma: Optional[float] = Field(None, description="Statistical significance of velocity fit (v / sigma_v)")
     position_angle_deg: Optional[float] = Field(None, description="Position angle of motion vector in degrees East of North")
     rms_residual_arcsec: Optional[float] = Field(None, description="Root-mean-square spatial residual in arcsec")
     max_residual_sigma: Optional[float] = Field(None, description="Maximum normalized residual across all detections")
     reduced_chi2: Optional[float] = Field(None, description="Reduced chi-squared goodness of fit")
     degrees_of_freedom: Optional[int] = Field(None, description="Degrees of freedom in model fit")
     fit_assessment: str = Field(..., description="Scientific plain-language evaluation of the model fit")
+    disclaimer: str = Field(
+        "Statistical motion candidate does not establish orbit determination or celestial body identification.",
+        description="Scientific integrity disclaimer"
+    )
 
 class TrajectoryValidationInfo(BaseModel):
     reference_catalog_or_service: str = "SPHEREx Internal Multi-Epoch Astrometry"
@@ -84,6 +95,8 @@ class MultiEpochTrack(BaseModel):
     validation_info: TrajectoryValidationInfo
     timeline: List[MatchedEpoch]
     created_at: Optional[str] = None
+    history: List[Dict[str, Any]] = Field(default_factory=list, description="Audit log of user modifications / state changes")
+    redo_stack: List[Dict[str, Any]] = Field(default_factory=list, description="Redo actions stack")
 
 class SourceTrackResponse(BaseModel):
     reference_observation_id: str
@@ -100,9 +113,18 @@ class SourceTrackResponse(BaseModel):
 class TrackSourceTaskRequest(BaseModel):
     reference_observation_id: str
     reference_source_id: str
-    matching_radius_arcsec: float = 45.0
+    matching_radius_arcsec: float = 15.0
+    motion_prior: str = Field("slow_mover", description="'static' (<=0.1'/d), 'slow_mover' (<=3.0'/d), or 'fast_mover' (<=30.0'/d)")
     observation_ids: Optional[List[str]] = None
     track_id: Optional[str] = None
+
+class AcceptCandidateRequest(BaseModel):
+    observation_id: str
+    candidate_source_id: str
+
+class ProposeMatchRequest(BaseModel):
+    observation_id: str
+    source_id: str
 
 class PredictionRequest(BaseModel):
     reference_observation_id: str

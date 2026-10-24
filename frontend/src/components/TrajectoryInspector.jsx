@@ -14,8 +14,12 @@ import {
   ChevronUp,
   Clock,
   Layers,
-  Sparkles
+  Sparkles,
+  Download,
+  RotateCcw,
+  RotateCw
 } from "lucide-react";
+import { api } from "../services/api";
 import { getStableTrackColor } from "../utils/colors";
 
 export const TrajectoryInspector = ({
@@ -25,7 +29,8 @@ export const TrajectoryInspector = ({
   onOpenSkyPlot,
   onFocusTrack,
   onDeleteTrack,
-  onSelectObservation
+  onSelectObservation,
+  onUpdateTrack = null
 }) => {
   const [activeTab, setActiveTab] = useState("timeline"); // "timeline" | "fit" | "missed"
 
@@ -100,6 +105,58 @@ export const TrajectoryInspector = ({
           </div>
 
           <div className="flex items-center space-x-2">
+            {/* Undo / Redo */}
+            <button
+              onClick={async () => {
+                try {
+                  const undone = await api.undoTrack(track.track_id);
+                  if (onUpdateTrack) onUpdateTrack(undone);
+                } catch (e) {
+                  alert(e.message);
+                }
+              }}
+              disabled={!track.history || track.history.length <= 1}
+              className="p-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-white/10 text-slate-300 disabled:opacity-30 transition-colors"
+              title="Undo last modification"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+            </button>
+            <button
+              onClick={async () => {
+                try {
+                  const redone = await api.redoTrack(track.track_id);
+                  if (onUpdateTrack) onUpdateTrack(redone);
+                } catch (e) {
+                  alert(e.message);
+                }
+              }}
+              disabled={!track.redo_stack || track.redo_stack.length === 0}
+              className="p-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-white/10 text-slate-300 disabled:opacity-30 transition-colors"
+              title="Redo last modification"
+            >
+              <RotateCw className="w-3.5 h-3.5" />
+            </button>
+
+            {/* Export Dropdown / Buttons */}
+            <a
+              href={api.getTrackExportUrl(track.track_id, "csv")}
+              download={`${track.track_id}.csv`}
+              className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-white/10 text-slate-200 transition-colors flex items-center space-x-1 text-xs"
+              title="Export verifiable track table as CSV"
+            >
+              <Download className="w-3 h-3 text-cyan-400" />
+              <span>CSV</span>
+            </a>
+            <a
+              href={api.getTrackExportUrl(track.track_id, "json")}
+              download={`${track.track_id}.json`}
+              className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-white/10 text-slate-200 transition-colors flex items-center space-x-1 text-xs"
+              title="Export complete provenance and astrometry as JSON"
+            >
+              <Download className="w-3 h-3 text-cyan-400" />
+              <span>JSON</span>
+            </a>
+
             <button
               onClick={() => onOpenSkyPlot?.(track)}
               className="px-2.5 py-1 rounded-lg bg-cyan-950/70 hover:bg-cyan-900 border border-cyan-700/60 text-cyan-200 transition-colors flex items-center space-x-1.5 text-xs"
@@ -171,7 +228,7 @@ export const TrajectoryInspector = ({
                 : "N/A (Stationary)"}
             </span>
             <span className="text-[10px] text-slate-400 block mt-0.5">
-              PA: {fit.position_angle_deg != null ? `${fit.position_angle_deg.toFixed(1)}° E of N` : "—"}
+              {fit.rate_arcsec_day != null ? `${fit.rate_arcsec_day.toFixed(3)}″/d (${(fit.rate_arcsec_day / 24).toFixed(4)}″/h)` : `PA: ${fit.position_angle_deg != null ? `${fit.position_angle_deg.toFixed(1)}°` : "—"}`}
             </span>
           </div>
 
@@ -181,9 +238,22 @@ export const TrajectoryInspector = ({
               RMS: {fit.rms_residual_arcsec != null ? `${fit.rms_residual_arcsec.toFixed(3)}″` : "0.000″"}
             </span>
             <span className="text-[10px] text-amber-300 block mt-0.5">
-              χ²_red: {fit.reduced_chi2 != null ? fit.reduced_chi2.toFixed(2) : "—"} (DoF: {fit.degrees_of_freedom ?? 0})
+              χ²_red: {fit.reduced_chi2 != null ? fit.reduced_chi2.toFixed(2) : "—"} (DoF: {fit.degrees_of_freedom ?? "0"})
             </span>
           </div>
+        </div>
+
+        {/* Scientific Integrity Disclaimer Banner */}
+        <div className="px-4 py-2 bg-amber-950/30 border-b border-amber-500/20 text-[10px] text-amber-300/90 flex items-center justify-between">
+          <div className="flex items-center space-x-1.5">
+            <Info className="w-3.5 h-3.5 shrink-0 text-amber-400" />
+            <span>{fit.disclaimer || "Statistical motion candidate does not establish orbit determination or celestial body identification."}</span>
+          </div>
+          {fit.velocity_significance_sigma != null && (
+            <span className="px-1.5 py-0.5 rounded bg-black/40 text-amber-200 border border-amber-500/30">
+              Significance: {fit.velocity_significance_sigma.toFixed(1)}σ
+            </span>
+          )}
         </div>
 
         {/* Tab Navigation */}
@@ -244,13 +314,13 @@ export const TrajectoryInspector = ({
                   {timeline.map((ep, idx) => {
                     const isRef = ep.observation_id === track.reference_observation_id;
                     return (
-                      <tr
-                        key={ep.observation_id || idx}
-                        onClick={() => onSelectObservation?.(ep.observation_id)}
-                        className={`hover:bg-white/5 transition-colors cursor-pointer ${
-                          isRef ? "bg-cyan-950/20" : ""
-                        }`}
-                      >
+                      <React.Fragment key={ep.observation_id || idx}>
+                        <tr
+                          onClick={() => onSelectObservation?.(ep.observation_id)}
+                          className={`hover:bg-white/5 transition-colors cursor-pointer ${
+                            isRef ? "bg-cyan-950/20" : ""
+                          }`}
+                        >
                         <td className="py-2 px-2 whitespace-nowrap">
                           <div className="flex items-center space-x-1.5">
                             <span className="font-bold text-white">E{idx + 1}</span>
@@ -380,6 +450,40 @@ export const TrajectoryInspector = ({
                           </span>
                         </td>
                       </tr>
+                      {ep.competing_candidates && ep.status === "Ambiguous match" && (
+                        <tr key={`comp_${ep.observation_id}`} className="bg-rose-950/20 text-[10px]">
+                          <td colSpan={9} className="py-2 px-3">
+                            <div className="font-bold text-rose-300 mb-1 flex items-center space-x-1">
+                              <AlertCircle className="w-3 h-3 text-rose-400" />
+                              <span>Competing Candidates ({ep.competing_candidates.length}):</span>
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                              {ep.competing_candidates.map((cand) => (
+                                <div key={cand.source_id} className="p-1.5 rounded bg-black/60 border border-white/10 flex items-center space-x-2">
+                                  <span className="font-bold text-white">{cand.source_id}</span>
+                                  <span className="text-slate-400">Sep: {cand.separation_arcsec}″</span>
+                                  <span className="text-slate-400">SNR: {cand.snr?.toFixed(1) || "—"}σ</span>
+                                  <button
+                                    onClick={async (e) => {
+                                      e.stopPropagation();
+                                      try {
+                                        const updated = await api.acceptCandidate(track.track_id, ep.observation_id, cand.source_id);
+                                        if (onUpdateTrack) onUpdateTrack(updated);
+                                      } catch (err) {
+                                        alert(err.message);
+                                      }
+                                    }}
+                                    className="px-2 py-0.5 rounded bg-cyan-700 hover:bg-cyan-600 text-white font-sans text-[10px] shadow"
+                                  >
+                                    Accept
+                                  </button>
+                                </div>
+                              ))}
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
                     );
                   })}
                 </tbody>

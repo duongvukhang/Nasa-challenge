@@ -1,5 +1,8 @@
+import os
+import json
 import math
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
 import numpy as np
 from astropy.coordinates import SkyCoord
@@ -13,7 +16,8 @@ from app.schemas.tracking import (
     TrajectoryFitInfo,
     TrajectoryValidationInfo,
     MultiEpochTrack,
-    TrackSourceTaskRequest
+    TrackSourceTaskRequest,
+    SourceTrackResponse
 )
 from app.schemas.observation import ObservationMetadata
 from app.services.coordinate_service import coordinate_service
@@ -32,6 +36,14 @@ TRACK_PALETTE = [
     "#a3e635",  # Lime
 ]
 
+MOTION_PRIOR_RATES = {
+    "static": 0.1,       # <= 0.1"/day
+    "slow_mover": 3.0,   # <= 3.0"/day (e.g. Kuiper Belt Object, Planet X candidate)
+    "fast_mover": 30.0   # <= 30.0"/day (e.g. near-Earth asteroid, comet)
+}
+
+TRACKS_STORE_PATH = Path("backend/data/tracks.json")
+
 def get_stable_track_color(track_id: str) -> str:
     """
     Deterministically computes a stable color for any track ID.
@@ -44,6 +56,108 @@ def get_stable_track_color(track_id: str) -> str:
         h = ((h * 31) + ord(char)) & 0xFFFFFFFF
     return TRACK_PALETTE[h % len(TRACK_PALETTE)]
 
+def perform_forced_aperture_photometry(
+    data: np.ndarray,
+    px: float,
+    py: float,
+    flags: Optional[np.ndarray] = None,
+    variance: Optional[np.ndarray] = None,
+    r_ap: float = 3.0,
+    r_in: float = 5.0,
+    r_out: float = 8.0
+) -> Dict[str, Any]:
+    """
+    Computes forced circular aperture photometry at pixel (px, py)
+    with local sky background subtraction and error propagation using
+    the VARIANCE extension and FLAGS mask when available.
+    """
+    h, w = data.shape
+    if px < r_out or px >= (w - r_out) or py < r_out or py >= (h - r_out):
+        return {
+            "status": "unavailable",
+            "reason": "Predicted position too close to image boundary",
+            "flux": None,
+            "uncertainty": None,
+            "upper_limit_3sigma": None
+        }
+
+    x_min, x_max = int(px - r_out - 1), int(px + r_out + 2)
+    y_min, y_max = int(py - r_out - 1), int(py + r_out + 2)
+
+    y_grid, x_grid = np.ogrid[y_min:y_max, x_min:x_max]
+    dist_sq = (x_grid - px)**2 + (y_grid - py)**2
+
+    ap_mask = dist_sq <= r_ap**2
+    ann_mask = (dist_sq >= r_in**2) & (dist_sq <= r_out**2)
+
+    sub_data = data[y_min:y_max, x_min:x_max]
+    sub_finite = np.isfinite(sub_data)
+
+    if flags is not None:
+        sub_flags = flags[y_min:y_max, x_min:x_max]
+        valid_mask = sub_finite & (sub_flags == 0)
+    else:
+        valid_mask = sub_finite
+
+    ann_valid = ann_mask & valid_mask
+    if np.sum(ann_valid) < 10:
+        return {
+            "status": "unavailable",
+            "reason": "Insufficient valid unflagged pixels in background annulus",
+            "flux": None,
+            "uncertainty": None,
+            "upper_limit_3sigma": None
+        }
+
+    bg_vals = sub_data[ann_valid]
+    bg_median = float(np.median(bg_vals))
+    bg_std = float(np.std(bg_vals))
+
+    ap_valid = ap_mask & valid_mask
+    n_ap = int(np.sum(ap_valid))
+    n_ann = int(np.sum(ann_valid))
+
+    if n_ap < 5:
+        return {
+            "status": "unavailable",
+            "reason": "Aperture contains too many flagged/bad pixels",
+            "flux": None,
+            "uncertainty": None,
+            "upper_limit_3sigma": None
+        }
+
+    raw_flux = float(np.sum(sub_data[ap_valid]))
+    net_flux = raw_flux - (bg_median * n_ap)
+
+    if variance is not None:
+        sub_var = variance[y_min:y_max, x_min:x_max]
+        var_valid = np.isfinite(sub_var) & (sub_var >= 0)
+        if np.sum(ap_valid & var_valid) >= 5:
+            ap_var_sum = float(np.sum(sub_var[ap_valid & var_valid]))
+            ann_var_mean = float(np.mean(sub_var[ann_valid & var_valid])) if np.sum(ann_valid & var_valid) > 0 else (bg_std**2)
+            flux_err = math.sqrt(ap_var_sum + (n_ap**2 / max(1, n_ann)) * ann_var_mean)
+        else:
+            flux_err = bg_std * math.sqrt(n_ap * (1.0 + n_ap / max(1, n_ann)))
+    else:
+        flux_err = bg_std * math.sqrt(n_ap * (1.0 + n_ap / max(1, n_ann)))
+
+    upper_limit = 3.0 * flux_err
+
+    if net_flux >= 3.0 * flux_err and net_flux > 0:
+        return {
+            "status": "forced_aperture",
+            "flux": round(net_flux, 4),
+            "uncertainty": round(flux_err, 4),
+            "upper_limit_3sigma": round(upper_limit, 4)
+        }
+    else:
+        return {
+            "status": "upper_limit",
+            "flux": round(net_flux, 4) if net_flux > 0 else None,
+            "uncertainty": round(flux_err, 4),
+            "upper_limit_3sigma": round(upper_limit, 4)
+        }
+
 class TrajectoryService:
     """
     Interactive multi-epoch source tracking and scientific trajectory quality checking.
@@ -53,8 +167,32 @@ class TrajectoryService:
     """
 
     def __init__(self):
-        # In-memory store of active tracks for this session
         self._tracks: Dict[str, MultiEpochTrack] = {}
+        self._load_persisted_tracks()
+
+    def _load_persisted_tracks(self):
+        """Loads persisted tracks from disk on startup if available."""
+        if TRACKS_STORE_PATH.exists():
+            try:
+                with open(TRACKS_STORE_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    for tr_dict in data:
+                        tr = MultiEpochTrack(**tr_dict)
+                        self._tracks[tr.track_id] = tr
+            except Exception:
+                pass
+
+    def _save_tracks(self):
+        """Atomically persists tracks to disk."""
+        try:
+            TRACKS_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = TRACKS_STORE_PATH.with_suffix(".json.tmp")
+            data = [tr.model_dump() for tr in self._tracks.values()]
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp_path, TRACKS_STORE_PATH)
+        except Exception:
+            pass
 
     def list_tracks(self) -> List[MultiEpochTrack]:
         return list(self._tracks.values())
@@ -65,12 +203,14 @@ class TrajectoryService:
     def delete_track(self, track_id: str) -> bool:
         if track_id in self._tracks:
             del self._tracks[track_id]
+            self._save_tracks()
             return True
         return False
 
     def clear_tracks(self) -> int:
         count = len(self._tracks)
         self._tracks.clear()
+        self._save_tracks()
         return count
 
     def track_source(self, req: TrackSourceTaskRequest) -> MultiEpochTrack:
@@ -84,7 +224,6 @@ class TrajectoryService:
 
         ref_meta: ObservationMetadata = ref_obs_record["metadata"]
 
-        # Track ID generation
         track_id = req.track_id or f"trk_{req.reference_observation_id}_{req.reference_source_id}"
         color = get_stable_track_color(track_id)
 
@@ -129,6 +268,7 @@ class TrajectoryService:
                 created_at=datetime.now(timezone.utc).isoformat()
             )
             self._tracks[track_id] = track
+            self._save_tracks()
             return track
 
         # Detect sources in reference observation
@@ -142,13 +282,10 @@ class TrajectoryService:
 
         ref_source = next((s for s in ref_sources_resp.sources if s.id == req.reference_source_id), None)
         if not ref_source:
-            if len(ref_sources_resp.sources) > 0:
-                ref_source = ref_sources_resp.sources[0]
-            else:
-                raise ValueError(f"Source '{req.reference_source_id}' not found in '{req.reference_observation_id}'.")
+            raise ValueError(f"Source '{req.reference_source_id}' not found in observation '{req.reference_observation_id}'.")
 
         if ref_source.ra_deg is None or ref_source.dec_deg is None:
-            raise ValueError(f"Reference source lacks celestial coordinates.")
+            raise ValueError("Reference source lacks celestial coordinates.")
 
         ref_ra = float(ref_source.ra_deg)
         ref_dec = float(ref_source.dec_deg)
@@ -162,12 +299,9 @@ class TrajectoryService:
         else:
             obs_list = all_obs
 
-        # Sort chronologically by MJD
         obs_list.sort(key=lambda o: (o.mjd_obs if o.mjd_obs is not None else 0.0))
 
-        # Handle duplicate products within the same observation epoch:
-        # If multiple products share near-identical MJD (< 2 sec) and observation group ID,
-        # retain unique epochs to avoid artificial zero-dt duplicate waypoints.
+        # Collapse duplicate co-temporal products within the same epoch (< 2 sec)
         unique_epochs: List[ObservationMetadata] = []
         seen_epochs = set()
         for o in obs_list:
@@ -175,15 +309,17 @@ class TrajectoryService:
             if epoch_key not in seen_epochs:
                 seen_epochs.add(epoch_key)
                 unique_epochs.append(o)
-        
-        # Ensure reference observation is included
+
         if not any(o.observation_id == req.reference_observation_id for o in unique_epochs):
             ref_in_all = next((o for o in all_obs if o.observation_id == req.reference_observation_id), None)
             if ref_in_all:
                 unique_epochs.append(ref_in_all)
                 unique_epochs.sort(key=lambda o: (o.mjd_obs if o.mjd_obs is not None else 0.0))
 
-        eff_radius = max(float(req.matching_radius_arcsec), 35.0)
+        # Motion prior and dynamic search radius
+        prior_key = req.motion_prior if req.motion_prior in MOTION_PRIOR_RATES else "slow_mover"
+        prior_rate = MOTION_PRIOR_RATES[prior_key]
+        base_radius = float(req.matching_radius_arcsec)
 
         # Detect sources for each epoch
         cached_sources: Dict[str, List[Any]] = {}
@@ -212,8 +348,11 @@ class TrajectoryService:
             if not rec:
                 continue
 
-            dt_days = float(o.mjd_obs - ref_mjd) if (o.mjd_obs is not None and ref_mjd is not None) else None
+            dt_days = float(o.mjd_obs - ref_mjd) if (o.mjd_obs is not None and ref_mjd is not None) else 0.0
             band = getattr(o, "band", None) or "LVF"
+
+            # Dynamic search radius = base + (prior_rate * |dt|) + 3 * sigma_pos
+            eff_radius = base_radius + (prior_rate * abs(dt_days)) + (3.0 * ref_unc)
 
             # 1. Check celestial WCS
             if not o.wcs.has_wcs or rec["wcs"] is None:
@@ -223,12 +362,13 @@ class TrajectoryService:
                         dataset_id=o.filename,
                         date_obs=o.date_obs,
                         mjd_obs=o.mjd_obs,
-                        time_delta_days=dt_days,
+                        time_delta_days=dt_days if o.mjd_obs is not None else None,
                         band=band,
                         status=MatchStatus.INSUFFICIENT_DATA,
                         confidence_score=0.0,
                         confidence_rationale="Observation lacks valid celestial WCS.",
-                        is_measured=False
+                        is_measured=False,
+                        photometry_status="unavailable"
                     )
                 )
                 continue
@@ -242,12 +382,13 @@ class TrajectoryService:
                         dataset_id=o.filename,
                         date_obs=o.date_obs,
                         mjd_obs=o.mjd_obs,
-                        time_delta_days=dt_days,
+                        time_delta_days=dt_days if o.mjd_obs is not None else None,
                         band=band,
                         status=MatchStatus.OUTSIDE_FOV,
                         confidence_score=0.0,
                         confidence_rationale="Reference sky position does not project onto image detector plane.",
-                        is_measured=False
+                        is_measured=False,
+                        photometry_status="unavailable"
                     )
                 )
                 continue
@@ -261,17 +402,18 @@ class TrajectoryService:
                         dataset_id=o.filename,
                         date_obs=o.date_obs,
                         mjd_obs=o.mjd_obs,
-                        time_delta_days=dt_days,
+                        time_delta_days=dt_days if o.mjd_obs is not None else None,
                         band=band,
                         status=MatchStatus.OUTSIDE_FOV,
                         confidence_score=0.0,
                         confidence_rationale="Target coordinates are outside geometric detector boundaries.",
-                        is_measured=False
+                        is_measured=False,
+                        photometry_status="unavailable"
                     )
                 )
                 continue
 
-            # 3. If this is the starting epoch E0 itself:
+            # 3. If starting epoch E0 itself:
             if obs_id == req.reference_observation_id:
                 ep = MatchedEpoch(
                     observation_id=obs_id,
@@ -296,7 +438,8 @@ class TrajectoryService:
                     confidence_score=1.0,
                     confidence_rationale="Starting epoch E0 reference detection.",
                     position_uncertainty_arcsec=ref_unc,
-                    is_measured=True
+                    is_measured=True,
+                    photometry_status="measured"
                 )
                 timeline.append(ep)
                 detected_epochs.append({
@@ -315,7 +458,6 @@ class TrajectoryService:
 
             for s in target_sources:
                 if s.ra_deg is not None and s.dec_deg is not None:
-                    # Great-circle angular separation with proper RA wraparound and declination curvature
                     s_c = SkyCoord(ra=s.ra_deg * u.deg, dec=s.dec_deg * u.deg, frame="icrs")
                     sep_arcsec = float(ref_c.separation(s_c).arcsec)
                     if sep_arcsec <= eff_radius:
@@ -324,19 +466,35 @@ class TrajectoryService:
             candidates.sort(key=lambda c: c[0])
 
             if len(candidates) == 0:
+                # Forced aperture photometry at predicted position
+                phot = perform_forced_aperture_photometry(
+                    data=rec["data"],
+                    px=px,
+                    py=py,
+                    flags=rec.get("flags"),
+                    variance=rec.get("variance")
+                )
+
                 timeline.append(
                     MatchedEpoch(
                         observation_id=obs_id,
                         dataset_id=o.filename,
                         date_obs=o.date_obs,
                         mjd_obs=o.mjd_obs,
-                        time_delta_days=dt_days,
+                        time_delta_days=dt_days if o.mjd_obs is not None else None,
                         band=band,
                         status=MatchStatus.NOT_DETECTED,
                         candidate_count=0,
                         confidence_score=0.0,
-                        confidence_rationale=f"Field observed, but no candidate detected above threshold within {eff_radius:.1f}\" search radius.",
-                        is_measured=False
+                        confidence_rationale=(
+                            f"Field observed, but no source detected above threshold within {eff_radius:.1f}\" "
+                            f"(prior: {prior_key}). Forced aperture photometry status: {phot['status']}."
+                        ),
+                        is_measured=False,
+                        photometry_status=phot["status"],
+                        flux=phot.get("flux"),
+                        flux_uncertainty=phot.get("uncertainty"),
+                        upper_limit_3sigma=phot.get("upper_limit_3sigma")
                     )
                 )
             elif len(candidates) == 1:
@@ -354,7 +512,7 @@ class TrajectoryService:
                     dataset_id=o.filename,
                     date_obs=o.date_obs,
                     mjd_obs=o.mjd_obs,
-                    time_delta_days=dt_days,
+                    time_delta_days=dt_days if o.mjd_obs is not None else None,
                     pixel_x=best_src.pixel_x,
                     pixel_y=best_src.pixel_y,
                     ra_deg=best_src.ra_deg,
@@ -375,7 +533,8 @@ class TrajectoryService:
                         f"SNR: {best_src.snr:.1f}σ in {band}."
                     ),
                     position_uncertainty_arcsec=tgt_unc,
-                    is_measured=True
+                    is_measured=True,
+                    photometry_status="measured"
                 )
                 timeline.append(ep)
                 detected_epochs.append({
@@ -395,12 +554,26 @@ class TrajectoryService:
 
                 score = round(float(0.4 * math.exp(-0.5 * min(10.0, sep_sigma**2))), 3)
 
+                competing = [
+                    {
+                        "source_id": s.id,
+                        "pixel_x": s.pixel_x,
+                        "pixel_y": s.pixel_y,
+                        "ra_deg": s.ra_deg,
+                        "dec_deg": s.dec_deg,
+                        "separation_arcsec": round(c_sep, 3),
+                        "snr": s.snr,
+                        "flux": s.peak_flux
+                    }
+                    for c_sep, s in candidates
+                ]
+
                 ep = MatchedEpoch(
                     observation_id=obs_id,
                     dataset_id=o.filename,
                     date_obs=o.date_obs,
                     mjd_obs=o.mjd_obs,
-                    time_delta_days=dt_days,
+                    time_delta_days=dt_days if o.mjd_obs is not None else None,
                     pixel_x=best_src.pixel_x,
                     pixel_y=best_src.pixel_y,
                     ra_deg=best_src.ra_deg,
@@ -415,13 +588,15 @@ class TrajectoryService:
                     status=MatchStatus.AMBIGUOUS_MATCH,
                     matched_source_id=best_src.id,
                     candidate_count=len(candidates),
+                    competing_candidates=competing,
                     confidence_score=score,
                     confidence_rationale=(
-                        f"Ambiguous: {len(candidates)} candidates within search radius. "
+                        f"Ambiguous: {len(candidates)} candidates within search radius ({eff_radius:.1f}\"). "
                         f"Closest candidate is {sep_arcsec:.2f}\" away. Source blending or crowded field."
                     ),
                     position_uncertainty_arcsec=tgt_unc,
-                    is_measured=True
+                    is_measured=True,
+                    photometry_status="measured"
                 )
                 timeline.append(ep)
                 detected_epochs.append({
@@ -433,7 +608,6 @@ class TrajectoryService:
                     "matched_epoch": ep
                 })
 
-        # Calculate trajectory kinematics, fit models, and quality status
         fit_info, quality_status, quality_rationale = self._evaluate_trajectory_quality(
             detected_epochs=detected_epochs,
             total_eligible=len(unique_epochs),
@@ -452,6 +626,14 @@ class TrajectoryService:
             )
         )
 
+        initial_action = {
+            "action": "create",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "reference_observation_id": req.reference_observation_id,
+            "reference_source_id": req.reference_source_id,
+            "motion_prior": prior_key
+        }
+
         track = MultiEpochTrack(
             track_id=track_id,
             color=color,
@@ -468,11 +650,145 @@ class TrajectoryService:
             fit_info=fit_info,
             validation_info=val_info,
             timeline=timeline,
-            created_at=datetime.now(timezone.utc).isoformat()
+            created_at=datetime.now(timezone.utc).isoformat(),
+            history=[initial_action],
+            redo_stack=[]
         )
 
         self._tracks[track_id] = track
+        self._save_tracks()
         return track
+
+    def accept_candidate(self, track_id: str, observation_id: str, candidate_source_id: str) -> MultiEpochTrack:
+        """
+        Accepts a specific candidate in an ambiguous epoch and updates trajectory fit.
+        Appends action to history and clears redo stack.
+        """
+        track = self.get_track(track_id)
+        if not track:
+            raise ValueError(f"Track '{track_id}' not found.")
+
+        target_ep = next((ep for ep in track.timeline if ep.observation_id == observation_id), None)
+        if not target_ep:
+            raise ValueError(f"Observation '{observation_id}' not found in track timeline.")
+
+        # Check competing candidates
+        chosen = None
+        if target_ep.competing_candidates:
+            chosen = next((c for c in target_ep.competing_candidates if c["source_id"] == candidate_source_id), None)
+
+        if not chosen:
+            # Fall back to checking detection service
+            rec = fits_service.get_observation(observation_id)
+            if rec:
+                resp = source_detection_service.detect_sources(
+                    observation_id=observation_id,
+                    data=rec["data"],
+                    astropy_wcs=rec["wcs"],
+                    flag_mask=rec.get("flags"),
+                    bunit=rec["metadata"].bunit
+                )
+                src = next((s for s in resp.sources if s.id == candidate_source_id), None)
+                if src:
+                    chosen = {
+                        "source_id": src.id,
+                        "pixel_x": src.pixel_x,
+                        "pixel_y": src.pixel_y,
+                        "ra_deg": src.ra_deg,
+                        "dec_deg": src.dec_deg,
+                        "snr": src.snr,
+                        "flux": src.peak_flux
+                    }
+
+        if not chosen:
+            raise ValueError(f"Candidate '{candidate_source_id}' not found in observation '{observation_id}'.")
+
+        # Snapshot current state for undo
+        snapshot = track.model_dump()
+        track.history.append({
+            "action": "accept_candidate",
+            "observation_id": observation_id,
+            "candidate_source_id": candidate_source_id,
+            "previous_state": snapshot
+        })
+        track.redo_stack.clear()
+
+        # Update target epoch
+        target_ep.matched_source_id = chosen["source_id"]
+        target_ep.pixel_x = chosen["pixel_x"]
+        target_ep.pixel_y = chosen["pixel_y"]
+        target_ep.ra_deg = chosen["ra_deg"]
+        target_ep.dec_deg = chosen["dec_deg"]
+        target_ep.status = MatchStatus.LIKELY_MATCH
+        target_ep.is_measured = True
+        target_ep.confidence_rationale = f"User-confirmed candidate match: {candidate_source_id}."
+
+        # Re-evaluate trajectory
+        ref_c = SkyCoord(ra=track.reference_ra_deg * u.deg, dec=track.reference_dec_deg * u.deg, frame="icrs")
+        detected_epochs = [
+            {
+                "obs_id": ep.observation_id,
+                "mjd": ep.mjd_obs,
+                "ra": ep.ra_deg,
+                "dec": ep.dec_deg,
+                "unc": ep.position_uncertainty_arcsec,
+                "matched_epoch": ep
+            }
+            for ep in track.timeline if ep.is_measured and ep.ra_deg is not None
+        ]
+
+        fit_info, q_status, q_rationale = self._evaluate_trajectory_quality(
+            detected_epochs=detected_epochs,
+            total_eligible=track.total_eligible_epochs,
+            timeline=track.timeline,
+            ref_c=ref_c
+        )
+        track.fit_info = fit_info
+        track.quality_status = q_status
+        track.quality_rationale = q_rationale
+        track.detected_epochs_count = len(detected_epochs)
+        track.missed_epochs_count = track.total_eligible_epochs - len(detected_epochs)
+
+        self._tracks[track_id] = track
+        self._save_tracks()
+        return track
+
+    def undo_track(self, track_id: str) -> Optional[MultiEpochTrack]:
+        """Reverts the last modification to the track."""
+        track = self.get_track(track_id)
+        if not track or len(track.history) <= 1:
+            return None
+
+        last_action = track.history.pop()
+        prev_state = last_action.get("previous_state")
+        if prev_state:
+            track.redo_stack.append(track.model_dump())
+            restored = MultiEpochTrack(**prev_state)
+            restored.history = track.history
+            restored.redo_stack = track.redo_stack
+            self._tracks[track_id] = restored
+            self._save_tracks()
+            return restored
+        return track
+
+    def redo_track(self, track_id: str) -> Optional[MultiEpochTrack]:
+        """Re-applies the undone action to the track."""
+        track = self.get_track(track_id)
+        if not track or not track.redo_stack:
+            return None
+
+        next_state = track.redo_stack.pop()
+        track.history.append({
+            "action": "redo",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "previous_state": track.model_dump()
+        })
+        restored = MultiEpochTrack(**next_state)
+        restored.history = track.history
+        restored.redo_stack = track.redo_stack
+        self._tracks[track_id] = restored
+        self._save_tracks()
+        return restored
 
     def _evaluate_trajectory_quality(
         self,
@@ -485,7 +801,7 @@ class TrajectoryService:
         Calculates trajectory fit (Stationary vs Linear Motion) and evaluates quality.
         Thresholds are explicitly documented:
         - INSUFFICIENT DATA: N_det < 2 detections
-        - REVIEW NEEDED: N_det == 2 detections (unverified motion), or high residuals > 3σ / chi2 > 2.5
+        - REVIEW NEEDED: N_det == 2 detections (displacement only; df=0), or high residuals > 3σ / chi2 > 2.5
         - AMBIGUOUS: Any epoch contains multiple candidates within search radius
         - STRONG MATCH: N_det >= 2 (stationary) or >= 3 (motion), chi2 <= 2.5, unambiguous
         """
@@ -519,23 +835,26 @@ class TrajectoryService:
             comb_unc = math.sqrt(p1["unc"]**2 + p2["unc"]**2)
             shift_sigma = total_sep / comb_unc if comb_unc > 0 else 1.0
 
-            # Compute rate
             pm_mas_yr = None
+            rate_day = None
+            rate_hour = None
             if dt_days > 0.001:
+                rate_day = round(total_sep / dt_days, 4)
+                rate_hour = round(rate_day / 24.0, 5)
                 dt_yr = dt_days / 365.25
                 pm_mas_yr = round((total_sep * 1000.0) / dt_yr, 2)
 
-            # Assign residuals to MatchedEpoch
             for item in detected_epochs:
                 item["matched_epoch"].residual_arcsec = round(total_sep / 2.0, 3)
                 item["matched_epoch"].residual_sigma = round(shift_sigma / 2.0, 2)
 
             if shift_sigma <= 2.5:
-                # Consistent with stationary star observed twice
                 fit_info = TrajectoryFitInfo(
                     fit_model=FitModelType.STATIONARY,
                     is_verified_motion=False,
                     proper_motion_mas_yr=pm_mas_yr,
+                    rate_arcsec_day=rate_day,
+                    rate_arcsec_hour=rate_hour,
                     position_angle_deg=round(pos_ang, 1),
                     rms_residual_arcsec=round(total_sep / 2.0, 3),
                     max_residual_sigma=round(shift_sigma / 2.0, 2),
@@ -552,14 +871,15 @@ class TrajectoryService:
                 return (
                     fit_info,
                     TrajectoryQualityStatus.STRONG_MATCH,
-                    f"Strong stationary match: Positional shift of {total_sep:.2f}\" across 2 epochs is within 1σ measurement uncertainty."
+                    f"Strong stationary match: Positional shift of {total_sep:.2f}\" across 2 epochs is within measurement uncertainty."
                 )
             else:
-                # Apparent displacement observed, but 2 points cannot verify a kinematic trajectory
                 fit_info = TrajectoryFitInfo(
                     fit_model=FitModelType.DISPLACEMENT_ONLY,
                     is_verified_motion=False,
                     proper_motion_mas_yr=pm_mas_yr,
+                    rate_arcsec_day=rate_day,
+                    rate_arcsec_hour=rate_hour,
                     position_angle_deg=round(pos_ang, 1),
                     rms_residual_arcsec=round(total_sep / 2.0, 3),
                     max_residual_sigma=round(shift_sigma / 2.0, 2),
@@ -567,7 +887,7 @@ class TrajectoryService:
                     degrees_of_freedom=None,
                     fit_assessment=(
                         f"Apparent displacement of {total_sep:.2f}\" ({shift_sigma:.1f}σ) across {dt_days:.2f} days (~{pm_mas_yr} mas/yr). "
-                        "Two detections establish displacement but do not independently verify a reliable motion trajectory."
+                        "Two detections establish displacement but do not independently verify a reliable motion trajectory (0 degrees of freedom)."
                     )
                 )
                 if has_ambiguity:
@@ -582,23 +902,21 @@ class TrajectoryService:
                     f"Review needed: Apparent displacement of {total_sep:.2f}\" across 2 detections. A third confirmation epoch is required to verify trajectory."
                 )
 
-        # 4. Three or more detections (N_det >= 3): Fit and validate motion model
+        # 4. Three or more detections (N_det >= 3)
         mjds = np.array([p["mjd"] for p in detected_epochs])
         ras = np.array([p["ra"] for p in detected_epochs])
         decs = np.array([p["dec"] for p in detected_epochs])
         uncs = np.array([p["unc"] for p in detected_epochs])
 
-        # Compute tangent-plane offsets relative to first point using spherical_offsets_to
         c0 = SkyCoord(ra=ras[0] * u.deg, dec=decs[0] * u.deg, frame="icrs")
         coords_all = SkyCoord(ra=ras * u.deg, dec=decs * u.deg, frame="icrs")
         d_ra_u, d_dec_u = c0.spherical_offsets_to(coords_all)
         x_arcsec = d_ra_u.to(u.arcsec).value
         y_arcsec = d_dec_u.to(u.arcsec).value
 
-        total_span_arcsec = float(coords_all[0].separation(coords_all[-1]).arcsec)
         dt_days_total = float(abs(mjds[-1] - mjds[0]))
 
-        # Include realistic astrometric systematic floor (0.15") for centroiding error
+        # Centroid positional uncertainty with realistic centroiding floor (0.15" ~ 0.025 pixel)
         eff_uncs = np.sqrt(uncs**2 + 0.15**2)
 
         # Model A: Stationary Fit (weighted centroid)
@@ -613,9 +931,18 @@ class TrajectoryService:
 
         # Model B: Linear Motion Fit
         dt_vec = mjds - mjds[0]
+        v_arcsec_day = 0.0
+        v_unc_day = 0.0
+        v_sig = 0.0
+        pos_ang = 0.0
+        pm_mas_yr = 0.0
+        pm_unc_mas_yr = None
+        rate_day = None
+        rate_hour = None
+
         if dt_days_total > 0.01:
-            poly_x = np.polyfit(dt_vec, x_arcsec, 1, w=1.0/eff_uncs)
-            poly_y = np.polyfit(dt_vec, y_arcsec, 1, w=1.0/eff_uncs)
+            poly_x, cov_x = np.polyfit(dt_vec, x_arcsec, 1, w=1.0/eff_uncs, cov=True)
+            poly_y, cov_y = np.polyfit(dt_vec, y_arcsec, 1, w=1.0/eff_uncs, cov=True)
             fit_x = np.polyval(poly_x, dt_vec)
             fit_y = np.polyval(poly_y, dt_vec)
 
@@ -625,36 +952,49 @@ class TrajectoryService:
             dof_mot = max(1, (2 * n_det) - 4)
             red_chi2_mot = chi2_mot / dof_mot
 
-            vx = poly_x[0]  # arcsec / day
-            vy = poly_y[0]  # arcsec / day
+            vx = float(poly_x[0])
+            vy = float(poly_y[0])
             v_arcsec_day = math.hypot(vx, vy)
+            sigma_vx = math.sqrt(max(0.0, float(cov_x[0, 0])))
+            sigma_vy = math.sqrt(max(0.0, float(cov_y[0, 0])))
+
+            if v_arcsec_day > 1e-6:
+                v_unc_day = math.sqrt((vx * sigma_vx)**2 + (vy * sigma_vy)**2) / v_arcsec_day
+                v_sig = v_arcsec_day / v_unc_day if v_unc_day > 0 else 0.0
+            else:
+                v_unc_day = 0.0
+                v_sig = 0.0
+
+            rate_day = round(v_arcsec_day, 4)
+            rate_hour = round(v_arcsec_day / 24.0, 5)
             pm_mas_yr = round((v_arcsec_day * 1000.0) * 365.25, 2)
+            pm_unc_mas_yr = round((v_unc_day * 1000.0) * 365.25, 2)
             pos_ang = (math.degrees(math.atan2(vx, vy)) + 360.0) % 360.0
         else:
             red_chi2_mot = 999.0
             res_mot_arcsec = res_stat_arcsec
             res_mot_sigma = res_stat_sigma
-            pm_mas_yr = 0.0
-            pos_ang = 0.0
+            dof_mot = max(1, (2 * n_det) - 4)
 
-        # Maximum pairwise separation across all detected epochs
         max_pair_sep = float(np.max([coords_all[i].separation(coords_all[j]).arcsec for i in range(len(coords_all)) for j in range(len(coords_all))]))
 
-        # Decide between stationary and moving object:
-        # Stationary if max pairwise dispersion is within ~2.5" or red_chi2_stat <= 3.0 with small total span
-        max_scatter_stat = np.max(res_stat_arcsec)
-        is_stationary = (max_pair_sep <= 2.5) or (red_chi2_stat <= 3.0 and max_pair_sep <= 4.0)
+        # Statistical decision between stationary and moving object
+        is_stationary = (v_sig < 3.0) or (max_pair_sep <= 2.5) or (red_chi2_stat <= 2.5 and max_pair_sep <= 4.0)
 
         if is_stationary:
-            # Assign residuals to MatchedEpoch
             for i, item in enumerate(detected_epochs):
                 item["matched_epoch"].residual_arcsec = round(float(res_stat_arcsec[i]), 3)
                 item["matched_epoch"].residual_sigma = round(float(res_stat_sigma[i]), 2)
 
+            max_scatter_stat = float(np.max(res_stat_arcsec))
             fit_info = TrajectoryFitInfo(
                 fit_model=FitModelType.STATIONARY,
                 is_verified_motion=False,
                 proper_motion_mas_yr=pm_mas_yr,
+                proper_motion_uncertainty_mas_yr=pm_unc_mas_yr,
+                rate_arcsec_day=rate_day,
+                rate_arcsec_hour=rate_hour,
+                velocity_significance_sigma=round(v_sig, 2),
                 position_angle_deg=round(pos_ang, 1),
                 rms_residual_arcsec=round(float(np.sqrt(np.mean(res_stat_arcsec**2))), 3),
                 max_residual_sigma=round(float(np.max(res_stat_sigma)), 2),
@@ -662,7 +1002,7 @@ class TrajectoryService:
                 degrees_of_freedom=dof_stat,
                 fit_assessment=(
                     f"Observed across {n_det} epochs with max dispersion {max_scatter_stat:.2f}\" "
-                    f"(χ²_red = {red_chi2_stat:.2f}). Object is kinematically consistent with a stationary celestial source."
+                    f"(χ²_red = {red_chi2_stat:.2f}, velocity significance {v_sig:.1f}σ). Kinematically consistent with a stationary celestial source."
                 )
             )
 
@@ -686,7 +1026,6 @@ class TrajectoryService:
                 )
 
         else:
-            # Moving object model
             for i, item in enumerate(detected_epochs):
                 item["matched_epoch"].residual_arcsec = round(float(res_mot_arcsec[i]), 3)
                 item["matched_epoch"].residual_sigma = round(float(res_mot_sigma[i]), 2)
@@ -698,14 +1037,18 @@ class TrajectoryService:
                 fit_model=FitModelType.LINEAR_MOTION,
                 is_verified_motion=True,
                 proper_motion_mas_yr=pm_mas_yr,
+                proper_motion_uncertainty_mas_yr=pm_unc_mas_yr,
+                rate_arcsec_day=rate_day,
+                rate_arcsec_hour=rate_hour,
+                velocity_significance_sigma=round(v_sig, 2),
                 position_angle_deg=round(pos_ang, 1),
                 rms_residual_arcsec=round(rms_mot, 3),
                 max_residual_sigma=round(max_sig, 2),
                 reduced_chi2=round(float(red_chi2_mot), 2),
                 degrees_of_freedom=dof_mot,
                 fit_assessment=(
-                    f"Linear apparent motion across {n_det} epochs. Apparent velocity: {pm_mas_yr} mas/yr "
-                    f"at PA {pos_ang:.1f}°. Residual RMS: {rms_mot:.2f}\" (χ²_red = {red_chi2_mot:.2f})."
+                    f"Linear apparent motion across {n_det} epochs with velocity significance {v_sig:.1f}σ. "
+                    f"Apparent velocity: {pm_mas_yr} mas/yr ({rate_day}\"/day) at PA {pos_ang:.1f}°. Residual RMS: {rms_mot:.2f}\" (χ²_red = {red_chi2_mot:.2f})."
                 )
             )
 

@@ -1,5 +1,8 @@
+import io
+import csv
+import json
 from typing import List, Optional
-from fastapi import APIRouter, HTTPException, Query, Body
+from fastapi import APIRouter, HTTPException, Query, Body, Response
 from pydantic import BaseModel
 
 from app.services.matching_service import matching_service
@@ -7,7 +10,8 @@ from app.services.trajectory_service import trajectory_service
 from app.schemas.tracking import (
     SourceTrackResponse,
     MultiEpochTrack,
-    TrackSourceTaskRequest
+    TrackSourceTaskRequest,
+    AcceptCandidateRequest
 )
 
 router = APIRouter(prefix="/tracking", tags=["Tracking"])
@@ -79,3 +83,116 @@ def delete_track_by_id(track_id: str):
     if not success:
         raise HTTPException(status_code=404, detail=f"Track '{track_id}' not found.")
     return {"status": "success", "deleted_track_id": track_id}
+
+@router.post("/tracks/{track_id}/undo", response_model=MultiEpochTrack)
+def undo_track_action(track_id: str):
+    """
+    Reverts the last modification to the specified track.
+    """
+    track = trajectory_service.undo_track(track_id)
+    if not track:
+        raise HTTPException(status_code=400, detail="Cannot undo: no prior state available.")
+    return track
+
+@router.post("/tracks/{track_id}/redo", response_model=MultiEpochTrack)
+def redo_track_action(track_id: str):
+    """
+    Re-applies the undone modification to the specified track.
+    """
+    track = trajectory_service.redo_track(track_id)
+    if not track:
+        raise HTTPException(status_code=400, detail="Cannot redo: no undone state available.")
+    return track
+
+@router.post("/tracks/{track_id}/accept", response_model=MultiEpochTrack)
+def accept_track_candidate(track_id: str, req: AcceptCandidateRequest):
+    """
+    Accepts a candidate detection in an ambiguous or candidate epoch and re-fits the trajectory.
+    """
+    try:
+        track = trajectory_service.accept_candidate(
+            track_id=track_id,
+            observation_id=req.observation_id,
+            candidate_source_id=req.candidate_source_id
+        )
+        return track
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Accept candidate error: {str(e)}")
+
+@router.get("/tracks/{track_id}/export")
+def export_track_data(
+    track_id: str,
+    format: str = Query("json", description="Export format: 'json' or 'csv'")
+):
+    """
+    Exports scientifically defensible multi-epoch track data including
+    provenance, kind markers (measured vs model vs missing), uncertainties, and fit info.
+    """
+    track = trajectory_service.get_track(track_id)
+    if not track:
+        raise HTTPException(status_code=404, detail=f"Track '{track_id}' not found.")
+
+    if format.lower() == "csv":
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "track_id",
+            "observation_id",
+            "date_obs",
+            "mjd_obs",
+            "kind",
+            "status",
+            "ra_deg",
+            "dec_deg",
+            "pos_uncertainty_arcsec",
+            "pixel_x",
+            "pixel_y",
+            "flux",
+            "flux_uncertainty",
+            "upper_limit_3sigma",
+            "snr",
+            "band",
+            "residual_arcsec",
+            "separation_arcsec"
+        ])
+        for ep in track.timeline:
+            kind = "measured" if ep.is_measured else ("missing" if ep.status in [MatchStatus.NOT_DETECTED, MatchStatus.OUTSIDE_FOV] else "unverified")
+            writer.writerow([
+                track.track_id,
+                ep.observation_id,
+                ep.date_obs or "",
+                ep.mjd_obs if ep.mjd_obs is not None else "",
+                kind,
+                ep.status.value,
+                ep.ra_deg if ep.ra_deg is not None else "",
+                ep.dec_deg if ep.dec_deg is not None else "",
+                ep.position_uncertainty_arcsec,
+                ep.pixel_x if ep.pixel_x is not None else "",
+                ep.pixel_y if ep.pixel_y is not None else "",
+                ep.flux if ep.flux is not None else "",
+                ep.flux_uncertainty if ep.flux_uncertainty is not None else "",
+                ep.upper_limit_3sigma if ep.upper_limit_3sigma is not None else "",
+                ep.snr if ep.snr is not None else "",
+                ep.band or "",
+                ep.residual_arcsec if ep.residual_arcsec is not None else "",
+                ep.separation_arcsec if ep.separation_arcsec is not None else ""
+            ])
+        csv_data = output.getvalue()
+        return Response(
+            content=csv_data,
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{track_id}.csv"'}
+        )
+
+    # JSON export
+    data = track.model_dump()
+    for ep in data["timeline"]:
+        ep["kind"] = "measured" if ep.get("is_measured") else ("missing" if ep.get("status") in [MatchStatus.NOT_DETECTED.value, MatchStatus.OUTSIDE_FOV.value] else "unverified")
+
+    return Response(
+        content=json.dumps(data, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{track_id}.json"'}
+    )
