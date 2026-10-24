@@ -15,12 +15,15 @@ import { SkyPlotModal } from "./components/SkyPlotModal";
 import { TrackListPanel } from "./components/TrackListPanel";
 import { ObjectInspectorModal } from "./components/ObjectInspectorModal";
 import { SelectedObjectManager } from "./components/SelectedObjectManager";
+import { ComparisonViewer } from "./components/ComparisonViewer";
 import { api } from "./services/api";
 
 export const App = () => {
   // Observations and active state
   const [observations, setObservations] = useState([]);
   const [activeObservationId, setActiveObservationId] = useState(null);
+  const [comparisonObservationId, setComparisonObservationId] = useState(null);
+  const [viewMode, setViewMode] = useState("single"); // "single" | "split" | "blink" | "difference"
   const [sources, setSources] = useState([]);
   const [selectedSource, setSelectedSource] = useState(null);
 
@@ -341,6 +344,22 @@ export const App = () => {
     }
   }, [activeObservationId, observations]);
 
+  // Keep comparisonObservationId synchronized to a valid alternate observation
+  useEffect(() => {
+    if (observations.length >= 2) {
+      setComparisonObservationId((prev) => {
+        if (prev && prev !== activeObservationId && observations.some((o) => o.observation_id === prev)) {
+          return prev;
+        }
+        const alt = observations.find((o) => o.observation_id !== activeObservationId);
+        return alt ? alt.observation_id : null;
+      });
+    } else {
+      setComparisonObservationId(null);
+      if (viewMode !== "single") setViewMode("single");
+    }
+  }, [observations, activeObservationId, viewMode]);
+
   // Load sources when active observation or detection parameters change
   useEffect(() => {
     if (!activeObservationId) {
@@ -563,29 +582,49 @@ export const App = () => {
   };
 
   const currentObs = observations.find((o) => o.observation_id === activeObservationId) || null;
+  const comparisonObs = observations.find((o) => o.observation_id === comparisonObservationId) || null;
 
   return (
     <div className="relative h-screen w-screen overflow-hidden bg-space-950 font-sans select-none">
       {/* 1. Full-Screen Astronomical Canvas (Primary Visual Experience) */}
-      <SkyViewer
-        observation={currentObs}
-        sources={sources}
-        selectedSource={selectedSource}
-        onSelectSource={handleSelectSource}
-        overlaySettings={overlaySettings}
-        displaySettings={displaySettings}
-        tracks={tracks}
-        activeTrackId={activeTrackId}
-        onSelectTrack={handleSelectTrack}
-        hiddenTrackIds={hiddenTrackIds}
-        trackData={trackData}
-        predictionData={predictionData}
-        centerTarget={centerTarget}
-      />
+      {viewMode === "single" || !comparisonObs ? (
+        <SkyViewer
+          observation={currentObs}
+          sources={sources}
+          selectedSource={selectedSource}
+          onSelectSource={handleSelectSource}
+          overlaySettings={overlaySettings}
+          displaySettings={displaySettings}
+          tracks={tracks}
+          activeTrackId={activeTrackId}
+          onSelectTrack={handleSelectTrack}
+          hiddenTrackIds={hiddenTrackIds}
+          trackData={trackData}
+          predictionData={predictionData}
+          centerTarget={centerTarget}
+        />
+      ) : (
+        <ComparisonViewer
+          viewMode={viewMode}
+          targetObservation={currentObs}
+          referenceObservation={comparisonObs}
+          sources={sources}
+          selectedSource={selectedSource}
+          onSelectSource={handleSelectSource}
+          tracks={tracks}
+          activeTrackId={activeTrackId}
+          onSelectTrack={handleSelectTrack}
+          hiddenTrackIds={hiddenTrackIds}
+          overlaySettings={overlaySettings}
+          displaySettings={displaySettings}
+          onChangeViewMode={setViewMode}
+        />
+      )}
 
       {/* 2. Top Floating Toolbar */}
       <TopToolbar
         currentObservation={currentObs}
+        observations={observations}
         sources={sources}
         selectedSource={selectedSource}
         onSelectSource={handleSelectSource}
@@ -596,6 +635,10 @@ export const App = () => {
         onToggleSettings={() => setIsSettingsOpen(!isSettingsOpen)}
         isFullscreen={isFullscreen}
         onToggleFullscreen={handleToggleFullscreen}
+        viewMode={viewMode}
+        onChangeViewMode={setViewMode}
+        comparisonObsId={comparisonObservationId}
+        onChangeComparisonObsId={setComparisonObservationId}
       />
 
       {/* 3. Stellarium-Inspired Collapsible Left Sidebar */}

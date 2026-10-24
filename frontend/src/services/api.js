@@ -281,5 +281,17 @@ export const api = {
     const res = await fetch(`${API_BASE}/api/observations`, { method: "DELETE" });
     if (!res.ok) throw new Error("Failed to clear observations");
     return res.json();
+  },
+
+  async getKnownObjects(obsId, radiusArcmin = 30.0) {
+    const res = await fetch(`${API_BASE}/api/observations/${obsId}/known-objects?radius_arcmin=${radiusArcmin}`);
+    if (!res.ok) throw new Error("Failed to query known solar system objects");
+    return res.json();
+  },
+
+  async crossMatchTrack(trackId, matchingRadiusArcsec = 15.0) {
+    const res = await fetch(`${API_BASE}/api/tracks/${trackId}/cross-match?matching_radius_arcsec=${matchingRadiusArcsec}`);
+    if (!res.ok) throw new Error("Failed to cross-match track with known objects");
+    return res.json();
   }
 };

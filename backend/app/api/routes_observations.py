@@ -7,6 +7,7 @@ from app.services.source_detection import source_detection_service
 from app.services.spectrum_service import spectrum_service, SpectralExtractionResponse
 from app.services.coordinate_service import coordinate_service
 from app.services.difference_service import difference_service
+from app.services.known_objects_service import known_objects_service
 from app.schemas.observation import (
     ObservationMetadata,
     SourceListResponse,
@@ -259,4 +260,20 @@ def get_rendered_difference_image(
         return Response(content=png_bytes, media_type="image/png")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+@router.get("/{observation_id}/known-objects")
+def get_known_objects_in_observation(
+    observation_id: str,
+    radius_arcmin: float = Query(30.0, ge=1.0, le=120.0, description="Search radius around field center")
+):
+    """
+    Queries authentic solar system ephemerides (IRSA MOST) for known asteroids and comets
+    located within the field of view of the specified observation.
+    Returns explicit unavailable status if network access is restricted or offline.
+    """
+    return known_objects_service.query_known_objects_in_field(
+        observation_id=observation_id,
+        radius_arcmin=radius_arcmin
+    )
+
 

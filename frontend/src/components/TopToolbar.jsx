@@ -10,11 +10,16 @@ import {
   Crosshair,
   Sparkles,
   CheckCircle2,
-  X
+  X,
+  Square,
+  Columns2,
+  RotateCw,
+  GitCompare
 } from "lucide-react";
 
 export const TopToolbar = ({
   currentObservation,
+  observations = [],
   sources = [],
   selectedSource,
   onSelectSource,
@@ -24,7 +29,11 @@ export const TopToolbar = ({
   isSettingsOpen,
   onToggleSettings,
   isFullscreen,
-  onToggleFullscreen
+  onToggleFullscreen,
+  viewMode = "single",
+  onChangeViewMode,
+  comparisonObsId,
+  onChangeComparisonObsId
 }) => {
   const [searchQuery, setSearchQuery] = useState("");
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
@@ -131,6 +140,80 @@ export const TopToolbar = ({
           </div>
         )}
       </div>
+
+      {/* Multi-Epoch Scientific Comparison Mode Selector */}
+      {observations && observations.length >= 2 && onChangeViewMode && (
+        <div className="hidden md:flex items-center space-x-1 stellarium-glass rounded-full px-1.5 py-1 pointer-events-auto shadow-lg text-xs font-mono">
+          <button
+            onClick={() => onChangeViewMode("single")}
+            className={`px-2 py-0.5 rounded-full flex items-center space-x-1 transition-colors ${
+              viewMode === "single"
+                ? "bg-cyan-500/30 text-cyan-300 font-bold"
+                : "text-slate-400 hover:text-slate-200"
+            }`}
+            title="Single Observation View"
+          >
+            <Square className="w-3 h-3" />
+            <span className="text-[11px]">Single</span>
+          </button>
+          <button
+            onClick={() => onChangeViewMode("split")}
+            className={`px-2 py-0.5 rounded-full flex items-center space-x-1 transition-colors ${
+              viewMode === "split"
+                ? "bg-cyan-500/30 text-cyan-300 font-bold"
+                : "text-slate-400 hover:text-slate-200"
+            }`}
+            title="Side-by-Side Synchronized Comparison"
+          >
+            <Columns2 className="w-3 h-3" />
+            <span className="text-[11px]">Split</span>
+          </button>
+          <button
+            onClick={() => onChangeViewMode("blink")}
+            className={`px-2 py-0.5 rounded-full flex items-center space-x-1 transition-colors ${
+              viewMode === "blink"
+                ? "bg-cyan-500/30 text-cyan-300 font-bold"
+                : "text-slate-400 hover:text-slate-200"
+            }`}
+            title="Blink Comparison (Alternating Epochs)"
+          >
+            <RotateCw className="w-3 h-3" />
+            <span className="text-[11px]">Blink</span>
+          </button>
+          <button
+            onClick={() => onChangeViewMode("difference")}
+            className={`px-2 py-0.5 rounded-full flex items-center space-x-1 transition-colors ${
+              viewMode === "difference"
+                ? "bg-cyan-500/30 text-cyan-300 font-bold"
+                : "text-slate-400 hover:text-slate-200"
+            }`}
+            title="Scientific Difference Imaging"
+          >
+            <GitCompare className="w-3 h-3" />
+            <span className="text-[11px]">Diff</span>
+          </button>
+
+          {/* Reference Epoch Selector when comparing */}
+          {viewMode !== "single" && onChangeComparisonObsId && (
+            <div className="flex items-center space-x-1.5 pl-2 border-l border-white/10 text-[11px] text-slate-300">
+              <span className="text-slate-500 text-[10px]">vs:</span>
+              <select
+                value={comparisonObsId || ""}
+                onChange={(e) => onChangeComparisonObsId(e.target.value)}
+                className="bg-space-900/90 text-cyan-300 text-[11px] font-mono rounded px-1.5 py-0.5 border border-white/10 focus:outline-none focus:border-cyan-500"
+              >
+                {observations
+                  .filter((o) => o.observation_id !== currentObservation?.observation_id)
+                  .map((o) => (
+                    <option key={o.observation_id} value={o.observation_id}>
+                      {o.observation_id} ({o.band || "LVF"} {o.date_obs ? o.date_obs.slice(0, 10) : ""})
+                    </option>
+                  ))}
+              </select>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Center: Stellarium-Style Search Omnibox */}
       <div ref={searchRef} className="relative pointer-events-auto max-w-sm w-full mx-2 hidden sm:block">

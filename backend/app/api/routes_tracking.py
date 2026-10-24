@@ -7,6 +7,7 @@ from pydantic import BaseModel
 
 from app.services.matching_service import matching_service
 from app.services.trajectory_service import trajectory_service
+from app.services.known_objects_service import known_objects_service
 from app.schemas.tracking import (
     SourceTrackResponse,
     MultiEpochTrack,
@@ -196,3 +197,21 @@ def export_track_data(
         media_type="application/json",
         headers={"Content-Disposition": f'attachment; filename="{track_id}.json"'}
     )
+
+@router.get("/{track_id}/cross-match")
+def cross_match_track(
+    track_id: str,
+    matching_radius_arcsec: float = Query(15.0, ge=1.0, le=60.0)
+):
+    """
+    Cross-matches candidate track with authentic solar system object ephemerides (IRSA MOST).
+    Differentiates candidate detections from confirmed known asteroids/comets.
+    """
+    res = known_objects_service.cross_match_track_with_known_objects(
+        track_id=track_id,
+        matching_radius_arcsec=matching_radius_arcsec
+    )
+    if res.get("status") == "track_not_found":
+        raise HTTPException(status_code=404, detail=f"Track '{track_id}' not found.")
+    return res
+
