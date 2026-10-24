@@ -1,11 +1,13 @@
 import os
 import math
 import uuid
-import httpx
-import pyvo
+import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
 from urllib.parse import urlparse
+import httpx
+import pyvo
 from astropy.time import Time
 from astropy.coordinates import SkyCoord
 import astropy.units as u
@@ -19,6 +21,7 @@ from app.schemas.archive import (
 )
 from app.config import settings
 from app.services.fits_service import fits_service
+from app.services.cache_index import cache_index
 
 # Authentic SPHEREx band configurations (Band 1 through 6)
 SPHEREX_BANDS = {
@@ -30,11 +33,28 @@ SPHEREX_BANDS = {
     "D6": {"name": "Band 6 (LVF6)", "min_um": 4.42, "max_um": 5.00, "center_um": 4.71},
 }
 
+ALLOWED_HOSTS = {
+    "irsa.ipac.caltech.edu",
+    "caltech-ipac.github.io",
+    "nasa-irsa-spherex.s3.amazonaws.com",
+    "localhost",
+    "127.0.0.1"
+}
+
+ALLOWED_BANDS = {
+    "ALL", "D1", "D2", "D3", "D4", "D5", "D6",
+    "LVF1", "LVF2", "LVF3", "LVF4", "LVF5", "LVF6",
+    "BAND1", "BAND2", "BAND3", "BAND4", "BAND5", "BAND6"
+}
+
 class IRSAClient:
     """
-    Client for querying the official NASA/IPAC Infrared Science Archive (IRSA)
-    SPHEREx TAP and SIA2 services. Provides query validation, epoch grouping,
-    safe download caching, and transparent cached-data fallback.
+    Client for querying the NASA/IPAC Infrared Science Archive (IRSA)
+    SPHEREx TAP service (spherex.obscore) and retrieving authenticated products.
+    Preserves strict data integrity:
+    - Never fabricates observation records or product IDs.
+    - Uses exact spherical footprint overlap for offline search.
+    - Enforces safe streaming downloads and verified product identity.
     """
 
     def __init__(self, tap_url: Optional[str] = None, sia_url: Optional[str] = None):
@@ -66,30 +86,24 @@ class IRSAClient:
                 clean_str += "T00:00:00"
             t = Time(clean_str, format="isot", scale="utc")
             return float(t.mjd)
-        except Exception as e:
+        except Exception:
             raise ValueError(f"Invalid date format: '{date_str}'. Expected 'YYYY-MM-DD' or ISO 8601 string.")
 
-    async def search_archive(self, params: ArchiveSearchParams) -> ArchiveSearchResponse:
-        """
-        Executes a spatial cone and temporal interval search across SPHEREx observations.
-        Queries the live IRSA TAP / SIA2 service. If the IRSA archive is unreachable,
-        falls back to locally cached authentic SPHEREx products (with explicit status tagging)
-        or returns a clear connectivity error if no cached products match.
-        """
-        # 1. Validate coordinates
+    def validate_search_params(self, params: ArchiveSearchParams) -> Tuple[float, Optional[float], Optional[float]]:
+        # 1. Coordinate ranges
         if not (0.0 <= params.ra_deg <= 360.0):
             raise ValueError(f"Right Ascension {params.ra_deg}° must be between 0.0° and 360.0°.")
         if not (-90.0 <= params.dec_deg <= 90.0):
             raise ValueError(f"Declination {params.dec_deg}° must be between -90.0° and +90.0°.")
 
-        # 2. Convert radius to degrees
+        # 2. Radius
         radius_deg = self.convert_radius_to_degrees(params.radius, params.radius_unit)
-        if radius_deg <= 0:
+        if radius_deg <= 0.0:
             raise ValueError("Search radius must be strictly greater than 0.")
         if radius_deg > 5.0:
             raise ValueError("Maximum allowed search radius is 5.0 degrees.")
 
-        # 3. Parse date intervals
+        # 3. Dates
         start_mjd: Optional[float] = None
         end_mjd: Optional[float] = None
         if params.start_date:
@@ -100,9 +114,29 @@ class IRSAClient:
         if start_mjd is not None and end_mjd is not None and start_mjd > end_mjd:
             raise ValueError(f"Start date '{params.start_date}' cannot be later than end date '{params.end_date}'.")
 
-        # 4. Construct ADQL query for IVOA TAP spherex.obscore
+        # 4. Band filter validation
+        if params.band and params.band.strip().upper() not in ALLOWED_BANDS:
+            raise ValueError(
+                f"Invalid band filter '{params.band}'. Allowed values: ALL, D1-D6, LVF1-LVF6, BAND1-BAND6."
+            )
+
+        return radius_deg, start_mjd, end_mjd
+
+    def build_adql_query(
+        self,
+        ra_deg: float,
+        dec_deg: float,
+        radius_deg: float,
+        start_mjd: Optional[float],
+        end_mjd: Optional[float],
+        band: Optional[str],
+        max_records: int
+    ) -> str:
+        """
+        Constructs ADQL query with footprint intersection semantics and temporal overlap.
+        """
         adql_where = [
-            f"CONTAINS(POINT('ICRS', s_ra, s_dec), CIRCLE('ICRS', {params.ra_deg:.6f}, {params.dec_deg:.6f}, {radius_deg:.6f})) = 1"
+            f"INTERSECTS(CIRCLE('ICRS', {ra_deg:.6f}, {dec_deg:.6f}, {radius_deg:.6f}), s_region) = 1"
         ]
 
         if start_mjd is not None:
@@ -110,13 +144,14 @@ class IRSAClient:
         if end_mjd is not None:
             adql_where.append(f"t_min <= {end_mjd:.5f}")
 
-        if params.band and params.band.upper() != "ALL":
-            band_clean = params.band.strip().replace("'", "")
-            adql_where.append(f"energy_bandpassname LIKE '%{band_clean}%'")
+        if band and band.upper() != "ALL":
+            band_clean = band.strip().replace("'", "").upper()
+            det_code = band_clean[-1] if band_clean[-1].isdigit() else band_clean
+            adql_where.append(f"(energy_bandpassname LIKE '%D{det_code}%' OR energy_bandpassname LIKE '%LVF{det_code}%')")
 
         where_clause = " AND ".join(adql_where)
-        adql = f"""
-            SELECT TOP {params.max_records}
+        return f"""
+            SELECT TOP {max_records}
                 obs_id, s_ra, s_dec, energy_bandpassname, em_min, em_max,
                 t_min, t_max, t_exptime, access_url, access_format, dataproduct_type,
                 target_name, obs_release_date
@@ -125,13 +160,24 @@ class IRSAClient:
             ORDER BY t_min ASC
         """
 
+    async def search_archive(self, params: ArchiveSearchParams) -> ArchiveSearchResponse:
+        """
+        Executes a spatial cone and temporal interval search across SPHEREx observations.
+        Queries the live IRSA TAP service. If unreachable, searches verified cached products.
+        If cache is empty or doesn't cover region, returns empty results with an explicit error status.
+        Never returns fabricated data.
+        """
+        radius_deg, start_mjd, end_mjd = self.validate_search_params(params)
+        adql = self.build_adql_query(
+            params.ra_deg, params.dec_deg, radius_deg, start_mjd, end_mjd, params.band, params.max_records
+        )
+
         records: List[ArchiveRecord] = []
         status = "LIVE_ARCHIVE"
         is_offline = False
         notes: List[str] = []
         error_detail: Optional[str] = None
 
-        # Attempt live IRSA TAP query
         try:
             tap = self._get_tap_service()
             results = tap.search(adql)
@@ -148,13 +194,14 @@ class IRSAClient:
                 em_min = float(row["em_min"]) if row["em_min"] is not None else None
                 em_max = float(row["em_max"]) if row["em_max"] is not None else None
                 center_um = ((em_min + em_max) / 2.0) * 1e6 if (em_min and em_max) else None
-                band_name = str(row["energy_bandpassname"]) if row.get("energy_bandpassname") else "LVF"
+                band_name = str(row["energy_bandpassname"]) if row.get("energy_bandpassname") else None
 
                 detector_code = None
-                for d_code in ["D1", "D2", "D3", "D4", "D5", "D6"]:
-                    if d_code in band_name.upper():
-                        detector_code = d_code
-                        break
+                if band_name:
+                    for d_code in ["D1", "D2", "D3", "D4", "D5", "D6"]:
+                        if d_code in band_name.upper():
+                            detector_code = d_code
+                            break
 
                 obs_id = str(row["obs_id"])
                 rec = ArchiveRecord(
@@ -165,12 +212,12 @@ class IRSAClient:
                     date_obs=date_obs_iso,
                     mjd_obs=round(t_min, 6) if t_min else None,
                     band=band_name,
-                    detector=detector_code or "D1",
+                    detector=detector_code,
                     wavelength_center_um=round(center_um, 3) if center_um else None,
                     wavelength_range_um=[round(em_min * 1e6, 2), round(em_max * 1e6, 2)] if (em_min and em_max) else None,
                     access_url=str(row["access_url"]) if row.get("access_url") else None,
-                    filesize_bytes=71600000,
-                    data_release=str(row["obs_release_date"]) if row.get("obs_release_date") else "QR2 Deep",
+                    filesize_bytes=None,
+                    data_release=str(row["obs_release_date"]) if row.get("obs_release_date") else None,
                     product_type="Level 2 Science Image",
                     spatial_coverage=f"Circle r={radius_deg:.3f}°",
                     retrieval_status=self._check_cached_status(obs_id),
@@ -184,34 +231,72 @@ class IRSAClient:
 
             if len(records) == 0:
                 notes.append(
-                    "No observations found for these search criteria. This does not necessarily mean the coordinates lie outside SPHEREx's overall survey coverage. The selected observation time interval, search radius, or detector filter may not contain published Level-2 products in the current data release. You can adjust the search radius, date interval, or band selection."
+                    "No observations found for these search criteria in the IRSA archive."
                 )
 
         except Exception as net_err:
-            # Live query failed (network offline / timeout / sandbox restriction)
-            # Try to match previously retrieved authentic SPHEREx products in local storage
-            cached_candidates = self._get_authentic_catalog_records(
-                params.ra_deg, params.dec_deg, radius_deg, start_mjd, end_mjd, params.band, params.max_records
+            # Remote archive query failed or network is sandboxed/offline
+            is_offline = True
+            # Search authentic verified cache index
+            cached_matches = cache_index.search_offline(
+                ra_deg=params.ra_deg,
+                dec_deg=params.dec_deg,
+                radius_deg=radius_deg,
+                start_mjd=start_mjd,
+                end_mjd=end_mjd,
+                band_filter=params.band,
+                max_records=params.max_records
             )
 
-            if cached_candidates:
+            if cached_matches:
                 status = "CACHED_FALLBACK"
-                is_offline = True
-                records = cached_candidates
+                for entry in cached_matches:
+                    det = entry.get("detector")
+                    band_info = SPHEREX_BANDS.get(det, {}) if det else {}
+                    b_name = band_info.get("name", f"Band {det}" if det else "LVF")
+                    c_um = band_info.get("center_um")
+                    w_range = [band_info["min_um"], band_info["max_um"]] if band_info else None
+                    crval = entry.get("crval") or [params.ra_deg, params.dec_deg]
+
+                    rec = ArchiveRecord(
+                        obs_id=entry["obs_id"],
+                        filename=Path(entry["local_path"]).name,
+                        ra_deg=round(crval[0], 6),
+                        dec_deg=round(crval[1], 6),
+                        date_obs=entry.get("date_obs"),
+                        mjd_obs=entry.get("mjd_obs"),
+                        band=b_name,
+                        detector=det,
+                        wavelength_center_um=c_um,
+                        wavelength_range_um=w_range,
+                        access_url=entry.get("source_url") or f"https://irsa.ipac.caltech.edu/data/SPHEREx/level2/{entry['obs_id']}.fits",
+                        filesize_bytes=entry.get("filesize_bytes"),
+                        data_release=entry.get("version"),
+                        product_type="Level 2 Science Image",
+                        spatial_coverage="Verified SPHEREx Footprint (Local Cache)",
+                        retrieval_status="cached",
+                        instrument="SPHEREx",
+                        service_source="Verified Local Cache",
+                        observation_group_id=self._extract_group_id(entry["obs_id"]),
+                        is_cached_fallback=True,
+                        source_origin="local_cache",
+                        cached_filepath=entry["local_path"]
+                    )
+                    records.append(rec)
+
                 notes.append(
-                    f"IRSA archive unreachable ({str(net_err)}). Displaying matching authentic SPHEREx products from local cache. Note: Local cache contains only previously retrieved products and does not represent full archive availability."
+                    f"IRSA archive unreachable ({type(net_err).__name__}). Displaying {len(records)} matching verified SPHEREx products from local cache."
                 )
             else:
                 status = "CONNECTION_ERROR"
-                is_offline = True
+                records = []
                 error_detail = (
-                    f"Unable to connect to NASA/IPAC IRSA archive ({str(net_err)}), and no matching cached SPHEREx products were found in local storage for coordinates ({params.ra_deg:.4f}°, {params.dec_deg:.4f}°). Please check network access or search near the North Ecliptic Pole deep survey (RA 276.26°, Dec 64.82°)."
+                    f"Unable to connect to NASA/IPAC IRSA archive ({type(net_err).__name__}: {str(net_err)}), and no verified cached products match the search region."
                 )
                 notes.append(
-                    "No observations found for these search criteria. The IRSA archive is currently unreachable and no suitable cached products match this region."
+                    "No observations found. The IRSA archive is currently unreachable and no verified cached products cover the requested coordinates."
                 )
 
-        # 5. Group records into distinct observation epochs
         epochs = self.group_records_into_epochs(records, is_cached_fallback=is_offline)
 
         return ArchiveSearchResponse(
@@ -240,23 +325,25 @@ class IRSAClient:
         self, records: List[ArchiveRecord], is_cached_fallback: bool = False
     ) -> List[ObservationEpoch]:
         """
-        Groups matching products by observation identity and timestamps into distinct observation epochs.
-        Products within 120 seconds of each other (e.g. multiple detector channels D1-D6 taken in the same visit)
-        are assigned to the same epoch.
+        Groups matching products by verified exposure/visit identity.
+        Does not merge separate exposures simply because their timestamps are close.
+        Preserves individual product WCS, wavelength range, and detector metadata.
         """
         if not records:
             return []
 
-        sorted_records = sorted(records, key=lambda r: (r.mjd_obs if r.mjd_obs is not None else 0.0))
+        sorted_records = sorted(
+            records,
+            key=lambda r: (r.mjd_obs if r.mjd_obs is not None else float("inf"), r.obs_id)
+        )
 
         epochs: List[ObservationEpoch] = []
-        current_epoch_records: List[ArchiveRecord] = []
+        current_group_id: Optional[str] = None
+        current_group_records: List[ArchiveRecord] = []
 
-        def flush_epoch(recs: List[ArchiveRecord], epoch_idx: int) -> ObservationEpoch:
+        def flush_group(recs: List[ArchiveRecord], epoch_idx: int) -> ObservationEpoch:
             ref = recs[0]
-            mjd_val = ref.mjd_obs or 60000.0
-            date_val = ref.date_obs or "2025-01-01T00:00:00"
-            group_id = ref.observation_group_id or f"visit_{int(mjd_val)}"
+            group_id = ref.observation_group_id or ref.obs_id
 
             prod_list = []
             for r in recs:
@@ -277,8 +364,8 @@ class IRSAClient:
             return ObservationEpoch(
                 epoch_id=f"epoch_{epoch_idx + 1:02d}_{group_id}",
                 epoch_index=epoch_idx,
-                date_obs=date_val,
-                mjd_obs=round(mjd_val, 6),
+                date_obs=ref.date_obs,
+                mjd_obs=ref.mjd_obs,
                 time_delta_days=None,
                 pointing_ra_deg=ref.ra_deg,
                 pointing_dec_deg=ref.dec_deg,
@@ -290,266 +377,195 @@ class IRSAClient:
             )
 
         for rec in sorted_records:
-            if not current_epoch_records:
-                current_epoch_records.append(rec)
+            grp = rec.observation_group_id or self._extract_group_id(rec.obs_id)
+            if current_group_id is None:
+                current_group_id = grp
+                current_group_records = [rec]
+            elif grp == current_group_id:
+                current_group_records.append(rec)
             else:
-                last_rec = current_epoch_records[-1]
-                dt_days = abs((rec.mjd_obs or 0.0) - (last_rec.mjd_obs or 0.0))
-                same_group = (
-                    rec.observation_group_id and
-                    last_rec.observation_group_id and
-                    rec.observation_group_id == last_rec.observation_group_id
-                )
-                if same_group or dt_days < 0.00139:
-                    current_epoch_records.append(rec)
-                else:
-                    epochs.append(flush_epoch(current_epoch_records, len(epochs)))
-                    current_epoch_records = [rec]
+                epochs.append(flush_group(current_group_records, len(epochs)))
+                current_group_id = grp
+                current_group_records = [rec]
 
-        if current_epoch_records:
-            epochs.append(flush_epoch(current_epoch_records, len(epochs)))
+        if current_group_records:
+            epochs.append(flush_group(current_group_records, len(epochs)))
 
-        if epochs:
-            t0_mjd = epochs[0].mjd_obs
+        # Compute delta days relative to epoch 0
+        if epochs and epochs[0].mjd_obs is not None:
+            t0 = epochs[0].mjd_obs
             for ep in epochs:
-                ep.time_delta_days = round(ep.mjd_obs - t0_mjd, 2)
+                if ep.mjd_obs is not None:
+                    ep.time_delta_days = round(ep.mjd_obs - t0, 3)
 
         return epochs
 
     def _extract_group_id(self, obs_id: str) -> str:
-        parts = obs_id.split("_")
-        if len(parts) >= 3:
+        """
+        Extracts verified visit/exposure identifier (e.g. '2025W28_1B_0480_4' from '2025W28_1B_0480_4_D1').
+        """
+        clean = obs_id.replace("level2_", "").replace("spherex_", "")
+        parts = clean.split("_")
+        if len(parts) >= 4:
+            return "_".join(parts[:4])
+        elif len(parts) >= 3:
             return "_".join(parts[:3])
-        return obs_id
+        return clean
 
     def _check_cached_status(self, obs_id: str) -> str:
         active_ids = [o.observation_id for o in fits_service.list_observations()]
         if obs_id in active_ids or f"irsa_{obs_id}" in active_ids:
             return "loaded"
 
-        cached_file = settings.CACHE_DIR / f"spherex_{obs_id}.fits"
-        if cached_file.exists() and cached_file.stat().st_size > 1000:
+        entry = cache_index.get_entry(obs_id)
+        if entry:
             return "cached"
 
         return "available"
 
-    def _get_authentic_catalog_records(
-        self,
-        ra_deg: float,
-        dec_deg: float,
-        radius_deg: float,
-        start_mjd: Optional[float],
-        end_mjd: Optional[float],
-        band_filter: Optional[str],
-        max_records: int
-    ) -> List[ArchiveRecord]:
+    def validate_url_security(self, url: str) -> str:
         """
-        Searches previously retrieved authentic SPHEREx products in local repository storage
-        at the North Ecliptic Pole deep survey (RA ~276.26°, Dec ~64.82°).
-        Only returns products that genuinely exist on disk and overlap the search region.
+        Validates URL scheme, hostname, credentials, and port.
+        Raises ValueError if unsafe.
         """
-        authentic_pool = [
-            {
-                "obs_id": "2025W18_1B_0001_1_D1",
-                "group_id": "2025W18_1B_0001",
-                "ra": 276.2614,
-                "dec": 64.8258,
-                "date_obs": "2025-04-28T13:00:15.755",
-                "mjd_obs": 60793.5418,
-                "detector": "D1",
-                "local_file": settings.SAMPLES_DIR / "spherex_qr2_deep_2025W18_1B_0001_1_D1.fits"
-            },
-            {
-                "obs_id": "2025W18_1B_0001_1_D2",
-                "group_id": "2025W18_1B_0001",
-                "ra": 276.2614,
-                "dec": 64.8258,
-                "date_obs": "2025-04-28T13:00:15.755",
-                "mjd_obs": 60793.5418,
-                "detector": "D2",
-                "local_file": settings.CACHE_DIR / "spherex_2025W18_1B_0001_1.fits"
-            },
-            {
-                "obs_id": "2025W23_2B_0061_1_D4",
-                "group_id": "2025W23_2B_0061",
-                "ra": 276.2311,
-                "dec": 64.8375,
-                "date_obs": "2025-06-05T19:06:53.947",
-                "mjd_obs": 60831.7965,
-                "detector": "D4",
-                "local_file": settings.CACHE_DIR / "spherex_2025W23_2B_0061_1.fits"
-            },
-            {
-                "obs_id": "2025W28_1B_0480_4_D1",
-                "group_id": "2025W28_1B_0480",
-                "ra": 276.2500,
-                "dec": 64.8100,
-                "date_obs": "2025-07-09T14:56:47.965",
-                "mjd_obs": 60865.6228,
-                "detector": "D1",
-                "local_file": settings.UPLOADS_DIR / "93848c5909a4_level2_2025W28_1B_0480_4D1_spx_l2b-v20-2025-260.fits"
-            },
-            {
-                "obs_id": "2025W34_1B_0112_2_D1",
-                "group_id": "2025W34_1B_0112",
-                "ra": 276.2800,
-                "dec": 64.8400,
-                "date_obs": "2025-08-20T08:14:22.100",
-                "mjd_obs": 60907.3433,
-                "detector": "D1",
-                "local_file": settings.SAMPLES_DIR / "spherex_qr2_deep_2025W18_1B_0001_1_D1.fits"
-            },
-            {
-                "obs_id": "2025W40_1B_0215_3_D1",
-                "group_id": "2025W40_1B_0215",
-                "ra": 276.2700,
-                "dec": 64.8350,
-                "date_obs": "2025-10-02T11:20:05.120",
-                "mjd_obs": 60950.4722,
-                "detector": "D1",
-                "local_file": settings.CACHE_DIR / "spherex_2025W28_1B_0480_4_D1.fits"
-            },
-            {
-                "obs_id": "2025W46_2A_0108_1_D2",
-                "group_id": "2025W46_2A_0108",
-                "ra": 276.2550,
-                "dec": 64.8200,
-                "date_obs": "2025-11-14T16:45:10.500",
-                "mjd_obs": 60993.6980,
-                "detector": "D2",
-                "local_file": settings.CACHE_DIR / "spherex_2025W18_1B_0001_1.fits"
-            }
-        ]
+        parsed = urlparse(url)
+        if parsed.scheme.lower() != "https":
+            raise ValueError(f"Security error: Invalid scheme '{parsed.scheme}'. Only HTTPS is permitted.")
 
-        results: List[ArchiveRecord] = []
-        for item in authentic_pool:
-            # Check physical file presence
-            loc_path = Path(item["local_file"])
-            if not loc_path.exists():
-                continue
+        if parsed.username or parsed.password:
+            raise ValueError("Security error: URLs containing user credentials are not permitted.")
 
-            # Angular distance check
-            cos_sep = (
-                math.sin(math.radians(dec_deg)) * math.sin(math.radians(item["dec"])) +
-                math.cos(math.radians(dec_deg)) * math.cos(math.radians(item["dec"])) *
-                math.cos(math.radians(ra_deg - item["ra"]))
-            )
-            cos_sep = max(-1.0, min(1.0, cos_sep))
-            sep_deg = math.degrees(math.acos(cos_sep))
+        host = (parsed.hostname or "").lower()
+        if not host:
+            raise ValueError("Security error: Missing hostname in URL.")
 
-            # Only match if within requested radius, or within 3.5 deg survey field
-            if sep_deg > max(radius_deg, 3.5):
-                continue
+        is_allowed = any(host == ah or host.endswith("." + ah) for ah in ALLOWED_HOSTS)
+        if not is_allowed:
+            raise ValueError(f"Security error: Download target '{host}' is not an authorized NASA/IPAC IRSA domain.")
 
-            if start_mjd is not None and item["mjd_obs"] < start_mjd:
-                continue
-            if end_mjd is not None and item["mjd_obs"] > end_mjd:
-                continue
+        if parsed.port and parsed.port not in (443, 8000, 5173):
+            raise ValueError(f"Security error: Port {parsed.port} is not authorized.")
 
-            det = item["detector"]
-            if band_filter and band_filter.upper() != "ALL":
-                if band_filter.upper() not in [det, f"LVF{det[-1]}", f"BAND{det[-1]}"]:
-                    continue
-
-            band_info = SPHEREX_BANDS.get(det, {})
-            b_name = band_info.get("name", f"Band {det}")
-            c_um = band_info.get("center_um")
-            w_range = [band_info.get("min_um", 0.75), band_info.get("max_um", 5.0)]
-
-            ret_status = self._check_cached_status(item["obs_id"])
-
-            results.append(
-                ArchiveRecord(
-                    obs_id=item["obs_id"],
-                    filename=f"{item['obs_id']}.fits",
-                    ra_deg=item["ra"],
-                    dec_deg=item["dec"],
-                    date_obs=item["date_obs"],
-                    mjd_obs=item["mjd_obs"],
-                    band=b_name,
-                    detector=det,
-                    wavelength_center_um=c_um,
-                    wavelength_range_um=w_range,
-                    access_url=f"https://irsa.ipac.caltech.edu/data/SPHEREx/level2/{item['obs_id']}.fits",
-                    filesize_bytes=int(loc_path.stat().st_size) if loc_path.exists() else 71600000,
-                    data_release="SPHEREx QR2 Deep (Cached)",
-                    product_type="Level 2 Science Image",
-                    spatial_coverage=f"SPHEREx Footprint 3.5° x 3.5° centered at ({item['ra']:.2f}°, {item['dec']:.2f}°)",
-                    retrieval_status=ret_status,
-                    instrument="SPHEREx",
-                    service_source="Local Repository Cache (Authentic SPHEREx Level-2)",
-                    observation_group_id=item["group_id"],
-                    is_cached_fallback=True,
-                    source_origin="local_cache",
-                    cached_filepath=str(loc_path)
-                )
-            )
-
-            if len(results) >= max_records:
-                break
-
-        return results
+        return url
 
     async def fetch_fits_from_datalink(self, datalink_url: str, obs_id: str) -> Path:
         """
-        Validates URL security and retrieves the FITS file into local cache.
-        If offline, safely maps to authentic SPHEREx data file in the repository.
+        Validates URL security, streams product with download size cap into temporary .part file,
+        validates FITS structure and OBSID identity, atomically moves to cache, and registers in index.
+        Never copies another local file or misidentifies products.
         """
-        parsed = urlparse(datalink_url)
-        allowed_hosts = [
-            "irsa.ipac.caltech.edu",
-            "caltech-ipac.github.io",
-            "localhost",
-            "127.0.0.1"
-        ]
-
-        is_safe_host = any(parsed.netloc.lower() == host or parsed.netloc.lower().endswith("." + host) for host in allowed_hosts)
-        if not is_safe_host and parsed.scheme in ["http", "https"]:
-            raise ValueError(f"Security error: Download target '{parsed.netloc}' is not an authorized NASA/IPAC IRSA domain.")
+        self.validate_url_security(datalink_url)
 
         safe_obs_id = "".join(c for c in obs_id if c.isalnum() or c in ("-", "_")).strip()
         if not safe_obs_id:
             safe_obs_id = str(uuid.uuid4())[:8]
 
-        cache_dest = settings.CACHE_DIR / f"spherex_{safe_obs_id}.fits"
-        if cache_dest.exists() and cache_dest.stat().st_size > 100000:
-            return cache_dest
+        # 1. Check if already verified in cache
+        cached_entry = cache_index.get_entry(safe_obs_id)
+        if cached_entry:
+            cached_path = Path(cached_entry["local_path"])
+            if cached_path.exists() and cached_path.stat().st_size == cached_entry["filesize_bytes"]:
+                return cached_path
 
-        # Check existing authentic local products
+        # 2. Check local authentic products by real content
         for local_cand in [
+            Path("SPHERExLVFSurveyData/level2_2025W28_1B_0480_4D1_spx_l2b-v20-2025-260.fits"),
             settings.SAMPLES_DIR / "spherex_qr2_deep_2025W18_1B_0001_1_D1.fits",
-            settings.CACHE_DIR / "spherex_2025W18_1B_0001_1.fits",
-            settings.CACHE_DIR / "spherex_2025W23_2B_0061_1.fits",
-            settings.UPLOADS_DIR / "93848c5909a4_level2_2025W28_1B_0480_4D1_spx_l2b-v20-2025-260.fits"
-        ]:
-            if local_cand.exists() and safe_obs_id in local_cand.name:
-                import shutil
-                shutil.copyfile(local_cand, cache_dest)
-                return cache_dest
-
-        # Attempt live download via HTTPX
-        direct_fits_url = datalink_url
-        try:
-            async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
-                resp = await client.get(direct_fits_url)
-                if resp.status_code == 200 and len(resp.content) > 1000:
-                    with open(cache_dest, "wb") as f:
-                        f.write(resp.content)
-                    return cache_dest
-        except Exception:
-            pass
-
-        # If download failed or was simulated, fall back to nearest authentic SPHEREx product
-        for fallback_path in [
-            settings.SAMPLES_DIR / "spherex_qr2_deep_2025W18_1B_0001_1_D1.fits",
-            settings.CACHE_DIR / "spherex_2025W18_1B_0001_1.fits",
             settings.CACHE_DIR / "spherex_2025W23_2B_0061_1.fits"
         ]:
-            if fallback_path.exists():
-                import shutil
-                shutil.copyfile(fallback_path, cache_dest)
-                return cache_dest
+            if local_cand.exists() and safe_obs_id in local_cand.name:
+                try:
+                    reg = cache_index.register_product(local_cand, expected_obs_id=safe_obs_id)
+                    return Path(reg["local_path"])
+                except Exception:
+                    pass
 
-        raise ValueError(f"Unable to retrieve FITS product for observation '{obs_id}' from IRSA archive.")
+        # 3. Stream download from remote URL with size limit and redirect validation
+        dest_cache_path = settings.CACHE_DIR / f"spherex_{safe_obs_id}.fits"
+        part_path = settings.CACHE_DIR / f"spherex_{safe_obs_id}_{uuid.uuid4().hex[:8]}.part"
+
+        current_url = datalink_url
+        max_redirects = 5
+
+        try:
+            async with httpx.AsyncClient(timeout=45.0, follow_redirects=False) as client:
+                redirect_count = 0
+                while redirect_count < max_redirects:
+                    self.validate_url_security(current_url)
+                    resp = await client.get(current_url)
+
+                    if resp.status_code in (301, 302, 303, 307, 308):
+                        location = resp.headers.get("location")
+                        if not location:
+                            raise ValueError(f"HTTP {resp.status_code} redirect without location header")
+                        current_url = location
+                        redirect_count += 1
+                        continue
+                    elif resp.status_code == 200:
+                        break
+                    else:
+                        raise ValueError(f"Remote archive returned HTTP {resp.status_code} for '{current_url}'")
+
+                if redirect_count >= max_redirects:
+                    raise ValueError(f"Exceeded maximum redirect count ({max_redirects})")
+
+                # Stream response into .part file enforcing size cap
+                bytes_downloaded = 0
+                with open(part_path, "wb") as f:
+                    async for chunk in resp.aiter_bytes(chunk_size=65536):
+                        bytes_downloaded += len(chunk)
+                        if bytes_downloaded > settings.MAX_UPLOAD_SIZE_BYTES:
+                            raise ValueError(
+                                f"Download exceeded size cap of {settings.MAX_UPLOAD_SIZE_BYTES} bytes."
+                            )
+                        f.write(chunk)
+
+            # Check if downloaded content is DataLink XML VOTable
+            with open(part_path, "rb") as f:
+                lead = f.read(100)
+
+            if lead.startswith(b"<?xml") or b"<VOTABLE" in lead:
+                # Parse DataLink VOTable to find direct FITS URL (#this)
+                try:
+                    tree = ET.parse(str(part_path))
+                    root = tree.getroot()
+                    ns = {"vo": "http://www.ivoa.net/xml/VOTable/v1.3"}
+                    fits_url = None
+                    for tr in root.findall(".//vo:TR", ns) or root.findall(".//TR"):
+                        tds = tr.findall("vo:TD", ns) or tr.findall("TD")
+                        td_texts = [td.text for td in tds if td.text]
+                        for txt in td_texts:
+                            if txt and txt.startswith("https://") and ".fits" in txt:
+                                fits_url = txt
+                                break
+                        if fits_url:
+                            break
+
+                    # Clean up temporary XML
+                    part_path.unlink(missing_ok=True)
+                    if fits_url:
+                        # Recursively fetch direct FITS
+                        return await self.fetch_fits_from_datalink(fits_url, obs_id)
+                except Exception as xml_err:
+                    raise ValueError(f"Failed to resolve DataLink document: {xml_err}")
+
+            # 4. Validate FITS structure, science HDU, and identity
+            meta = cache_index.validate_file_and_get_metadata(part_path, expected_obs_id=safe_obs_id)
+
+            # Atomically move .part to final destination
+            os.replace(str(part_path), str(dest_cache_path))
+
+            # Register in cache index
+            entry = cache_index.register_product(
+                dest_cache_path,
+                expected_obs_id=safe_obs_id,
+                source_url=datalink_url,
+                download_time=Time.now().isot
+            )
+            return dest_cache_path
+
+        except Exception as e:
+            part_path.unlink(missing_ok=True)
+            raise ValueError(f"Unable to retrieve verified FITS product for observation '{obs_id}': {str(e)}")
 
 irsa_client = IRSAClient()

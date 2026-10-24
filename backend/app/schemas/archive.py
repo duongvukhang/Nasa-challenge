@@ -25,7 +25,7 @@ class ArchiveRecord(BaseModel):
     wavelength_range_um: Optional[List[float]] = None
     access_url: Optional[str] = None
     filesize_bytes: Optional[int] = None
-    data_release: Optional[str] = "QR2 Deep"
+    data_release: Optional[str] = None
     product_type: str = "Level 2 Science Image"
     spatial_coverage: Optional[str] = None
     retrieval_status: str = "available"  # 'available', 'cached', 'loaded', 'downloading', 'error'
@@ -50,11 +50,11 @@ class EpochProduct(BaseModel):
 class ObservationEpoch(BaseModel):
     epoch_id: str
     epoch_index: int
-    date_obs: str
-    mjd_obs: float
+    date_obs: Optional[str] = None
+    mjd_obs: Optional[float] = None
     time_delta_days: Optional[float] = None
-    pointing_ra_deg: float
-    pointing_dec_deg: float
+    pointing_ra_deg: Optional[float] = None
+    pointing_dec_deg: Optional[float] = None
     products: List[EpochProduct] = []
     selected_product_id: Optional[str] = None
     is_loaded: bool = False
@@ -70,7 +70,7 @@ class ArchiveSearchResponse(BaseModel):
     records: List[ArchiveRecord] = []
     epochs: List[ObservationEpoch] = []
     spatial_search_semantics: str = (
-        "Cone search using IVOA SIA2 and TAP spherex.obscore CONTAINS(POINT('ICRS', s_ra, s_dec), CIRCLE('ICRS', ra, dec, radius_deg)) = 1"
+        "Footprint intersection using IVOA TAP spherex.obscore INTERSECTS(CIRCLE('ICRS', ra, dec, radius_deg), s_region) = 1 with spherical polygon verification"
     )
     temporal_search_semantics: str = (
         "Interval overlap filtering using MJD ranges: t_min <= interval_end_mjd AND t_max >= interval_start_mjd"
