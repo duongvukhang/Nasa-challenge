@@ -3,13 +3,10 @@ import {
   ZoomIn,
   ZoomOut,
   Maximize2,
-  Crosshair,
   Compass,
-  Sparkles,
-  CheckCircle2,
-  AlertCircle
 } from "lucide-react";
 import { api } from "../services/api";
+import { getStableTrackColor } from "../utils/colors";
 
 export const SkyViewer = ({
   observation,
@@ -18,8 +15,13 @@ export const SkyViewer = ({
   onSelectSource,
   overlaySettings = {},
   displaySettings = {},
+  tracks = {},
+  activeTrackId = null,
+  onSelectTrack = null,
+  hiddenTrackIds = new Set(),
   trackData = null,
   predictionData = null,
+  centerTarget = null,
   isLoading = false
 }) => {
   // Zoom & Pan state
@@ -30,6 +32,27 @@ export const SkyViewer = ({
   const containerRef = useRef(null);
   const imgRef = useRef(null);
 
+  // Center on target when requested
+  useEffect(() => {
+    if (centerTarget && imgRef.current && observation?.image_shape) {
+      const [imgHeight, imgWidth] = observation.image_shape;
+      if (centerTarget.pixel_x != null && centerTarget.pixel_y != null) {
+        const normOffsetX = (centerTarget.pixel_x - imgWidth / 2) / imgWidth;
+        const normOffsetY = (centerTarget.pixel_y - imgHeight / 2) / imgHeight;
+
+        const renderedW = imgRef.current.clientWidth || 800;
+        const renderedH = imgRef.current.clientHeight || 800;
+
+        const targetScale = Math.max(scale, 2.5);
+        setScale(targetScale);
+        setPan({
+          x: -normOffsetX * renderedW * targetScale,
+          y: normOffsetY * renderedH * targetScale
+        });
+      }
+    }
+  }, [centerTarget]);
+
   // Dynamic cursor celestial coordinate readout
   const [cursorPos, setCursorPos] = useState(null);
 
@@ -39,8 +62,15 @@ export const SkyViewer = ({
     setPan({ x: 0, y: 0 });
   }, []);
 
+  const prevObsIdRef = useRef(null);
+
+  // Preserve user zoom and pan during motion simulation and epoch switching.
+  // Only auto-reset on initial load or when loading the first observation from empty state.
   useEffect(() => {
-    handleResetView();
+    if (!prevObsIdRef.current && observation?.observation_id) {
+      handleResetView();
+    }
+    prevObsIdRef.current = observation?.observation_id || null;
   }, [observation?.observation_id, handleResetView]);
 
   // Zoom with scroll wheel
@@ -122,6 +152,42 @@ export const SkyViewer = ({
   }
 
   const [imgH, imgW] = observation.image_shape || [2048, 2048];
+
+  // Helper to accurately project celestial coordinates or epoch pixel positions
+  // into the CURRENT displayed observation's SVG pixel space.
+  const getEpochScreenCoords = (ep) => {
+    if (!ep) return null;
+
+    if (
+      ep.ra_deg != null &&
+      ep.dec_deg != null &&
+      observation?.wcs?.has_wcs &&
+      observation.wcs.crval &&
+      observation.wcs.crpix
+    ) {
+      const degPerPix = (observation.wcs.pixel_scale_arcsec || 6.2) / 3600;
+      const cosDec = Math.cos((observation.wcs.crval[1] * Math.PI) / 180) || 1.0;
+      const dx = -(ep.ra_deg - observation.wcs.crval[0]) * cosDec / degPerPix;
+      const dy = (ep.dec_deg - observation.wcs.crval[1]) / degPerPix;
+      const px = observation.wcs.crpix[0] + dx;
+      const py = imgH - (observation.wcs.crpix[1] + dy);
+      return { x: px, y: py };
+    }
+
+    if (ep.pixel_x != null && ep.pixel_y != null) {
+      return { x: ep.pixel_x, y: imgH - ep.pixel_y };
+    }
+
+    return null;
+  };
+
+  // Compile all active tracks (supporting multiple simultaneous tracks)
+  const allTrackList = Object.values(tracks).length > 0
+    ? Object.values(tracks)
+    : (trackData ? [trackData] : []);
+
+  const visibleTrackList = allTrackList.filter((tr) => tr && !hiddenTrackIds.has(tr.track_id));
+
   const imageUrl = api.getImageUrl(observation.observation_id, {
     stretch: displaySettings.stretch || "asinh",
     colormap: displaySettings.colormap || "inferno",
@@ -158,12 +224,12 @@ export const SkyViewer = ({
           src={imageUrl}
           alt={`SPHEREx Observation ${observation.filename}`}
           draggable={false}
-          className="max-w-[85vw] max-h-[85vh] object-contain shadow-2xl rounded-xs pointer-events-none border border-white/5"
+          className="block max-w-[85vw] max-h-[85vh] object-contain shadow-2xl select-none pointer-events-none"
         />
 
-        {/* Scientific Overlays (SVG) */}
+        {/* Scientific Overlays (SVG) — 1:1 pixel overlay over rendered image */}
         <svg
-          className="absolute inset-0 w-full h-full pointer-events-none"
+          className="absolute inset-0 w-full h-full pointer-events-none overflow-visible"
           viewBox={`0 0 ${imgW} ${imgH}`}
           preserveAspectRatio="none"
         >
@@ -196,73 +262,251 @@ export const SkyViewer = ({
             </g>
           )}
 
-          {/* 2. Tracking Trajectory Lines (When tracking and enabled) */}
-          {overlaySettings.showTrajectories && trackData?.timeline?.length > 1 && (
-            <g className="pointer-events-none">
-              {/* Draw polyline connecting epoch positions */}
-              {trackData.timeline.map((ep, idx) => {
-                if (idx === 0) return null;
-                const prev = trackData.timeline[idx - 1];
-                if (prev.pixel_x == null || ep.pixel_x == null) return null;
-                const sx1 = prev.pixel_x;
-                const sy1 = imgH - prev.pixel_y;
-                const sx2 = ep.pixel_x;
-                const sy2 = imgH - ep.pixel_y;
+          <defs>
+            <marker
+              id="trajArrow"
+              viewBox="0 0 10 10"
+              refX="6"
+              refY="5"
+              markerWidth="4"
+              markerHeight="4"
+              orient="auto-start-reverse"
+            >
+              <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#22d3ee" />
+            </marker>
+            <marker
+              id="predArrow"
+              viewBox="0 0 10 10"
+              refX="6"
+              refY="5"
+              markerWidth="4"
+              markerHeight="4"
+              orient="auto-start-reverse"
+            >
+              <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#f59e0b" />
+            </marker>
+          </defs>
 
-                return (
-                  <line
-                    key={`track_line_${idx}`}
-                    x1={sx1}
-                    y1={sy1}
-                    x2={sx2}
-                    y2={sy2}
-                    stroke="#22d3ee"
-                    strokeWidth={2}
+          {/* 2. Multi-Epoch Tracking Trajectories & Truth-Based Detection Markers */}
+          {overlaySettings.showTrajectories && visibleTrackList.map((tr) => {
+            const trackColor = tr.color || getStableTrackColor(tr.track_id);
+            const isActive = tr.track_id === activeTrackId;
+
+            // Extract measured waypoints reprojected into current field
+            const waypoints = (tr.timeline || [])
+              .filter((ep) => ep.is_measured)
+              .map((ep, idx) => {
+                const coords = getEpochScreenCoords(ep);
+                if (!coords) return null;
+                return {
+                  ...ep,
+                  epochIdx: idx + 1,
+                  screenX: coords.x,
+                  screenY: coords.y,
+                  isCurrent: ep.observation_id === observation?.observation_id
+                };
+              })
+              .filter(Boolean);
+
+            if (waypoints.length === 0) return null;
+
+            return (
+              <g key={`track_overlay_${tr.track_id}`}>
+                {/* Connecting trajectory segments across epochs */}
+                {waypoints.map((pt, idx) => {
+                  if (idx === 0) return null;
+                  const prev = waypoints[idx - 1];
+                  const isLast = idx === waypoints.length - 1;
+
+                  return (
+                    <g key={`traj_seg_${tr.track_id}_${idx}`} className="pointer-events-none">
+                      {/* Underlying glow for active track */}
+                      {isActive && (
+                        <line
+                          x1={prev.screenX}
+                          y1={prev.screenY}
+                          x2={pt.screenX}
+                          y2={pt.screenY}
+                          stroke={trackColor}
+                          strokeWidth={6}
+                          strokeOpacity={0.3}
+                          vectorEffect="non-scaling-stroke"
+                        />
+                      )}
+                      {/* Crisp trajectory line */}
+                      <line
+                        x1={prev.screenX}
+                        y1={prev.screenY}
+                        x2={pt.screenX}
+                        y2={pt.screenY}
+                        stroke={trackColor}
+                        strokeWidth={isActive ? 2.5 : 1.5}
+                        strokeDasharray={isActive ? "5,3" : "4,4"}
+                        strokeOpacity={isActive ? 1.0 : 0.75}
+                        vectorEffect="non-scaling-stroke"
+                      />
+                    </g>
+                  );
+                })}
+
+                {/* Waypoint dots for non-current epochs along the trajectory */}
+                {waypoints.map((pt) => {
+                  if (pt.isCurrent) return null; // Current epoch rendered below with full interactive reticle
+                  return (
+                    <g key={`traj_wpt_${tr.track_id}_${pt.epochIdx}`} className="pointer-events-none">
+                      <circle
+                        cx={pt.screenX}
+                        cy={pt.screenY}
+                        r={isActive ? 3 : 2}
+                        fill={trackColor}
+                        stroke="#ffffff"
+                        strokeWidth={0.8}
+                        vectorEffect="non-scaling-stroke"
+                      />
+                      <text
+                        x={pt.screenX + 5}
+                        y={pt.screenY - 4}
+                        fill={isActive ? trackColor : "#94a3b8"}
+                        fontSize={9}
+                        fontFamily="monospace"
+                        className="select-none drop-shadow"
+                      >
+                        E{pt.epochIdx}
+                      </text>
+                    </g>
+                  );
+                })}
+              </g>
+            );
+          })}
+
+          {/* Confirmed Detection Markers in Current Epoch (Truth-Based: Only when is_measured === true) */}
+          {visibleTrackList.map((tr) => {
+            const trackColor = tr.color || getStableTrackColor(tr.track_id);
+            const isActive = tr.track_id === activeTrackId;
+            const currentEp = tr.timeline?.find((ep) => ep.observation_id === observation?.observation_id);
+
+            // Strictly do NOT fabricate marker if source is outside FOV or not detected in this epoch
+            if (!currentEp || !currentEp.is_measured) return null;
+
+            const coords = getEpochScreenCoords(currentEp);
+            if (!coords) return null;
+
+            return (
+              <g
+                key={`current_detection_${tr.track_id}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onSelectTrack?.(tr.track_id);
+                }}
+                className="cursor-pointer pointer-events-auto"
+              >
+                {/* Active track glowing halo */}
+                {isActive && (
+                  <circle
+                    cx={coords.x}
+                    cy={coords.y}
+                    r={16}
+                    fill="none"
+                    stroke={trackColor}
+                    strokeWidth={1.5}
                     strokeDasharray="4,3"
+                    vectorEffect="non-scaling-stroke"
                   />
-                );
-              })}
-            </g>
-          )}
+                )}
+                {/* Main reticle */}
+                <circle
+                  cx={coords.x}
+                  cy={coords.y}
+                  r={isActive ? 9 : 7}
+                  fill={isActive ? `${trackColor}25` : "none"}
+                  stroke={trackColor}
+                  strokeWidth={isActive ? 2 : 1.5}
+                  vectorEffect="non-scaling-stroke"
+                />
+                {/* Center pip */}
+                <circle
+                  cx={coords.x}
+                  cy={coords.y}
+                  r={isActive ? 3.5 : 2.5}
+                  fill={isActive ? "#ffffff" : trackColor}
+                  stroke={isActive ? trackColor : "#ffffff"}
+                  strokeWidth={0.8}
+                  vectorEffect="non-scaling-stroke"
+                />
+                {/* Track label */}
+                <text
+                  x={coords.x + (isActive ? 14 : 10)}
+                  y={coords.y - 4}
+                  fill={trackColor}
+                  fontSize={isActive ? 11 : 9}
+                  fontFamily="monospace"
+                  fontWeight={isActive ? "bold" : "normal"}
+                  className="pointer-events-none select-none drop-shadow"
+                >
+                  {tr.track_id}
+                </text>
+              </g>
+            );
+          })}
 
           {/* 3. Prediction Vector & Trajectory (When available) */}
           {predictionData?.trajectory_points?.length > 1 && (
             <g className="pointer-events-none">
-              {/* Prediction dashed trajectory */}
+              {/* Prediction dashed trajectory in amber */}
               {predictionData.trajectory_points.map((pt, idx) => {
                 if (idx === 0) return null;
-                // Project predicted celestial coordinates to pixel space if WCS present
-                if (!observation.wcs?.has_wcs || !observation.wcs.crval || !observation.wcs.crpix) return null;
-                const degPerPix = (observation.wcs.pixel_scale_arcsec || 6.2) / 3600;
-                const cosDec = Math.cos((observation.wcs.crval[1] * Math.PI) / 180) || 1;
-
-                const dx = -(pt.ra_deg - observation.wcs.crval[0]) * cosDec / degPerPix;
-                const dy = (pt.dec_deg - observation.wcs.crval[1]) / degPerPix;
-                const px = observation.wcs.crpix[0] + dx;
-                const py = imgH - (observation.wcs.crpix[1] + dy);
+                const prev = predictionData.trajectory_points[idx - 1];
+                const p1 = getEpochScreenCoords({ ra_deg: prev.ra_deg, dec_deg: prev.dec_deg });
+                const p2 = getEpochScreenCoords({ ra_deg: pt.ra_deg, dec_deg: pt.dec_deg });
+                if (!p1 || !p2) return null;
+                const isLast = idx === predictionData.trajectory_points.length - 1;
 
                 return (
-                  <circle
-                    key={`pred_pt_${idx}`}
-                    cx={px}
-                    cy={py}
-                    r={3}
-                    fill="none"
-                    stroke="#f59e0b"
-                    strokeWidth={1.5}
-                    strokeDasharray="2,2"
-                  />
+                  <g key={`pred_seg_${idx}`}>
+                    <line
+                      x1={p1.x}
+                      y1={p1.y}
+                      x2={p2.x}
+                      y2={p2.y}
+                      stroke="rgba(245, 158, 11, 0.3)"
+                      strokeWidth={4}
+                      vectorEffect="non-scaling-stroke"
+                    />
+                    <line
+                      x1={p1.x}
+                      y1={p1.y}
+                      x2={p2.x}
+                      y2={p2.y}
+                      stroke="#f59e0b"
+                      strokeWidth={1.5}
+                      strokeDasharray="4,3"
+                      vectorEffect="non-scaling-stroke"
+                      markerEnd={isLast ? "url(#predArrow)" : undefined}
+                    />
+                    <circle
+                      cx={p2.x}
+                      cy={p2.y}
+                      r={2.5}
+                      fill="#f59e0b"
+                      stroke="#ffffff"
+                      strokeWidth={1}
+                      vectorEffect="non-scaling-stroke"
+                    />
+                  </g>
                 );
               })}
             </g>
           )}
 
-          {/* 4. Detected Sources Overlay */}
+          {/* 4. Detected Sources Overlay — thin green squares only */}
           {overlaySettings.showSources &&
             sources.map((src) => {
               const screenX = src.pixel_x;
               const screenY = imgH - src.pixel_y;
               const isSelected = src.id === selectedSource?.id;
+              const size = isSelected ? 18 : 10;
+              const half = size / 2;
 
               return (
                 <g
@@ -271,53 +515,29 @@ export const SkyViewer = ({
                     e.stopPropagation();
                     onSelectSource(src);
                   }}
-                  className="cursor-pointer group pointer-events-auto"
+                  className="cursor-pointer pointer-events-auto"
                 >
-                  {/* Positional Uncertainty Ellipse (When enabled) */}
-                  {overlaySettings.showUncertainty && (
-                    <circle
-                      cx={screenX}
-                      cy={screenY}
-                      r={Math.max(12, (src.position_uncertainty_arcsec || 0.5) * 8)}
-                      fill="none"
-                      stroke={isSelected ? "rgba(34, 211, 238, 0.4)" : "rgba(255, 255, 255, 0.2)"}
-                      strokeWidth={1}
-                      strokeDasharray="2,2"
-                    />
-                  )}
-
-                  {/* Outer reticle circle */}
-                  <circle
-                    cx={screenX}
-                    cy={screenY}
-                    r={isSelected ? 16 : 8}
-                    fill={isSelected ? "rgba(6, 182, 212, 0.25)" : "none"}
-                    stroke={isSelected ? "#22d3ee" : "rgba(34, 211, 238, 0.7)"}
-                    strokeWidth={isSelected ? 2 : 1.2}
+                  {/* Thin green square — no fill for unselected, faint fill for selected */}
+                  <rect
+                    x={screenX - half}
+                    y={screenY - half}
+                    width={size}
+                    height={size}
+                    fill={isSelected ? "rgba(34, 197, 94, 0.15)" : "none"}
+                    stroke={isSelected ? "#4ade80" : "#22c55e"}
+                    strokeWidth={isSelected ? 1.5 : 1}
+                    vectorEffect="non-scaling-stroke"
                   />
 
-                  {/* Reticle Crosshairs */}
-                  {isSelected && (
-                    <>
-                      <line x1={screenX - 22} y1={screenY} x2={screenX - 8} y2={screenY} stroke="#22d3ee" strokeWidth={1.5} />
-                      <line x1={screenX + 8} y1={screenY} x2={screenX + 22} y2={screenY} stroke="#22d3ee" strokeWidth={1.5} />
-                      <line x1={screenX} y1={screenY - 22} x2={screenX} y2={screenY - 8} stroke="#22d3ee" strokeWidth={1.5} />
-                      <line x1={screenX} y1={screenY + 8} x2={screenX} y2={screenY + 22} stroke="#22d3ee" strokeWidth={1.5} />
-                    </>
-                  )}
-
-                  {/* Center dot */}
-                  <circle cx={screenX} cy={screenY} r={isSelected ? 2.5 : 1.5} fill="#38bdf8" />
-
-                  {/* Source Label (When enabled) */}
+                  {/* Source Label (When enabled or selected) */}
                   {(overlaySettings.showLabels || isSelected) && (
                     <text
-                      x={screenX + 12}
-                      y={screenY - 8}
+                      x={screenX + half + 3}
+                      y={screenY - half + 2}
                       fill="#e2e8f0"
-                      fontSize={11}
+                      fontSize={10}
                       fontFamily="monospace"
-                      className="pointer-events-none drop-shadow-md select-none font-bold"
+                      className="pointer-events-none select-none"
                     >
                       {src.id}
                     </text>
@@ -325,6 +545,8 @@ export const SkyViewer = ({
                 </g>
               );
             })}
+
+
         </svg>
       </div>
 

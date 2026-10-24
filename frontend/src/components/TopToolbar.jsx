@@ -113,12 +113,17 @@ export const TopToolbar = ({
         {currentObservation && (
           <div className="hidden md:flex items-center space-x-1 pl-1 border-l border-white/10">
             {currentObservation.is_synthetic_demo ? (
-              <span className="flex items-center space-x-1 text-[10px] font-mono text-amber-400">
+              <span className="flex items-center space-x-1 text-[10px] font-mono text-amber-400" title="Simulated 3-epoch demonstration data">
                 <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
                 <span>DEMO</span>
               </span>
+            ) : currentObservation.data_provenance?.source?.includes("Cache") ? (
+              <span className="flex items-center space-x-1 text-[10px] font-mono text-amber-300" title="Authentic SPHEREx product loaded from local offline cache">
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
+                <span>CACHED SPHEREx</span>
+              </span>
             ) : (
-              <span className="flex items-center space-x-1 text-[10px] font-mono text-cyan-400">
+              <span className="flex items-center space-x-1 text-[10px] font-mono text-cyan-400" title="Authentic SPHEREx product retrieved from IRSA archive">
                 <span className="w-1.5 h-1.5 rounded-full bg-cyan-400" />
                 <span>REAL SPHEREx</span>
               </span>

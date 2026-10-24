@@ -199,12 +199,14 @@ class FITSService:
 
         # Timestamp extraction
         date_obs = (
+            (provenance_notes.get("date_obs") if provenance_notes else None) or
             header.get("DATE-OBS") or
             primary_header.get("DATE-OBS") or
             header.get("DATE") or
             primary_header.get("DATE")
         )
         mjd_obs = (
+            (provenance_notes.get("mjd_obs") if provenance_notes else None) or
             header.get("MJD-OBS") or
             primary_header.get("MJD-OBS")
         )

@@ -7,7 +7,8 @@ import {
   Disc,
   Activity,
   Clock,
-  Sliders
+  Sliders,
+  Layers
 } from "lucide-react";
 
 export const BottomDock = ({
@@ -18,7 +19,10 @@ export const BottomDock = ({
   isTimelineVisible,
   onToggleTimeline,
   isSettingsOpen,
-  onToggleSettings
+  onToggleSettings,
+  isTrackListOpen,
+  onToggleTrackList,
+  tracksCount = 0
 }) => {
   const tools = [
     {
@@ -48,6 +52,13 @@ export const BottomDock = ({
       icon: Compass,
       active: overlaySettings.showTrajectories,
       onClick: () => onToggleOverlay("showTrajectories")
+    },
+    {
+      id: "tracksList",
+      label: `Active Multi-Epoch Tracks (${tracksCount})`,
+      icon: Layers,
+      active: isTrackListOpen,
+      onClick: onToggleTrackList
     },
     {
       id: "showUncertainty",

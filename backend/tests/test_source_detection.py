@@ -61,3 +61,34 @@ def test_source_detection_nan_handling():
     )
 
     assert isinstance(res.sources, list)
+
+def test_source_detection_local_background_and_high_capacity():
+    """
+    Verifies that source detection handles non-uniform background (gradient)
+    using Background2D and detects sources up to high max_sources limit.
+    """
+    height, width = 128, 128
+    y, x = np.indices((height, width))
+    # Add a non-uniform background gradient across the field
+    bg_gradient = 5.0 + 0.1 * x + 0.05 * y
+    rng = np.random.default_rng(42)
+    noise = rng.normal(0, 0.2, (height, width))
+    data = (bg_gradient + noise).astype(np.float32)
+
+    # Inject 5 stars across different background brightness regions
+    star_positions = [(20, 20), (30, 80), (70, 40), (100, 100), (60, 110)]
+    for sx, sy in star_positions:
+        star = 15.0 * np.exp(-((x - sx)**2 + (y - sy)**2) / (2 * 1.5**2))
+        data += star.astype(np.float32)
+
+    res = source_detection_service.detect_sources(
+        observation_id="test_gradient",
+        data=data,
+        astropy_wcs=None,
+        threshold_sigma=3.0,
+        fwhm_pixels=3.0,
+        max_sources=500
+    )
+
+    assert res.total_sources >= 5
+    assert "Background2D" in res.detection_method

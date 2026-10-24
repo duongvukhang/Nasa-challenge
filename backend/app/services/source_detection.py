@@ -1,9 +1,10 @@
 import numpy as np
 from typing import List, Optional, Dict, Any, Tuple
-from astropy.stats import sigma_clipped_stats
+from astropy.stats import sigma_clipped_stats, SigmaClip
 from astropy.wcs import WCS
 from photutils.detection import DAOStarFinder, find_peaks
 from photutils.aperture import CircularAperture, aperture_photometry
+from photutils.background import Background2D, MedianBackground
 
 from app.schemas.observation import DetectedSource, SourceListResponse
 
@@ -22,10 +23,10 @@ class SourceDetectionService:
         bunit: str = "MJy/sr",
         threshold_sigma: float = 3.5,
         fwhm_pixels: float = 3.0,
-        max_sources: int = 150
+        max_sources: int = 500
     ) -> SourceListResponse:
         """
-        Executes robust point source detection.
+        Executes robust point source detection with local background estimation.
         """
         arr = np.array(data, dtype=np.float64, copy=True)
         finite_mask = np.isfinite(arr)
@@ -42,9 +43,36 @@ class SourceDetectionService:
                 sources=[]
             )
 
-        # Robust background estimation using sigma-clipped stats
-        mean_val, median_val, std_val = sigma_clipped_stats(arr[finite_mask], sigma=3.0, maxiters=5)
-        clean_arr = np.where(finite_mask, arr, median_val)
+        # Fill non-finite pixels with median for background estimation
+        _, global_median, global_std = sigma_clipped_stats(arr[finite_mask], sigma=3.0, maxiters=5)
+        clean_arr = np.where(finite_mask, arr, global_median)
+
+        # Local background estimation using Background2D for better spatial uniformity.
+        # Falls back to global stats if the image is too small or estimation fails.
+        bkg_map = None
+        bkg_rms_map = None
+        try:
+            box_size = max(16, min(64, min(arr.shape) // 8))
+            sigma_clip = SigmaClip(sigma=3.0, maxiters=5)
+            bkg_estimator = MedianBackground()
+            bkg2d = Background2D(
+                clean_arr,
+                box_size=(box_size, box_size),
+                filter_size=(3, 3),
+                sigma_clip=sigma_clip,
+                bkg_estimator=bkg_estimator,
+                coverage_mask=~finite_mask,
+                fill_value=global_median,
+            )
+            bkg_map = bkg2d.background
+            bkg_rms_map = bkg2d.background_rms
+            bkg_subtracted = clean_arr - bkg_map
+            # Use median of local RMS as detection threshold scale
+            std_val = float(np.median(bkg_rms_map[bkg_rms_map > 0])) if np.any(bkg_rms_map > 0) else global_std
+        except Exception:
+            # Graceful fallback to global stats
+            bkg_subtracted = clean_arr - global_median
+            std_val = global_std
 
         if std_val <= 1e-12:
             std_val = 1e-4
@@ -53,14 +81,12 @@ class SourceDetectionService:
         detected_list: List[DetectedSource] = []
 
         try:
-            # Use modern photutils keyword arguments
             daofind = DAOStarFinder(
                 fwhm=fwhm_pixels,
                 threshold=detection_threshold,
                 sharpness_range=(0.2, 1.5),
                 roundness_range=(-1.0, 1.0)
             )
-            bkg_subtracted = clean_arr - median_val
             sources_tbl = daofind(bkg_subtracted, mask=~finite_mask)
 
             if sources_tbl is not None and len(sources_tbl) > 0:
@@ -89,19 +115,19 @@ class SourceDetectionService:
                     except Exception:
                         pass
 
+                pix_scale_arcsec = 1.0
+                if astropy_wcs is not None:
+                    try:
+                        from astropy.wcs.utils import proj_plane_pixel_scales
+                        scales = proj_plane_pixel_scales(astropy_wcs)
+                        pix_scale_arcsec = float(np.mean(scales) * 3600.0)
+                    except Exception:
+                        pix_scale_arcsec = 1.0
+
                 for i in range(len(sources_to_process)):
                     peak_flux = float(sources_to_process["peak"][i])
                     snr = float(peak_flux / std_val) if std_val > 0 else None
                     int_flux = float(aper_fluxes[i]) if np.isfinite(aper_fluxes[i]) else None
-
-                    pix_scale_arcsec = 1.0
-                    if astropy_wcs is not None:
-                        try:
-                            from astropy.wcs.utils import proj_plane_pixel_scales
-                            scales = proj_plane_pixel_scales(astropy_wcs)
-                            pix_scale_arcsec = float(np.mean(scales) * 3600.0)
-                        except Exception:
-                            pix_scale_arcsec = 1.0
 
                     pos_err_pix = fwhm_pixels / (2.0 * max(1.0, snr)) if snr else 0.5
                     pos_err_arcsec = max(0.05, float(pos_err_pix * pix_scale_arcsec))
@@ -124,13 +150,13 @@ class SourceDetectionService:
                             position_uncertainty_arcsec=round(pos_err_arcsec, 3),
                             flags=0,
                             is_saturated=False,
-                            provenance="Photutils DAOStarFinder"
+                            provenance="Photutils DAOStarFinder + Background2D"
                         )
                     )
 
         except Exception as e:
             try:
-                peaks_tbl = find_peaks(clean_arr - median_val, threshold=detection_threshold, box_size=5)
+                peaks_tbl = find_peaks(bkg_subtracted, threshold=detection_threshold, box_size=5)
                 if peaks_tbl is not None and len(peaks_tbl) > 0:
                     peaks_tbl.sort("peak_value", reverse=True)
                     for i, row in enumerate(peaks_tbl[:max_sources]):
@@ -171,7 +197,7 @@ class SourceDetectionService:
 
         return SourceListResponse(
             observation_id=observation_id,
-            detection_method="Photutils DAOStarFinder (PSF fitting & sigma-clipping)",
+            detection_method="Photutils DAOStarFinder (Background2D local estimation)",
             total_sources=len(detected_list),
             threshold_sigma=threshold_sigma,
             sources=detected_list

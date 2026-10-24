@@ -6,10 +6,25 @@ class MatchStatus(str, Enum):
     LIKELY_MATCH = "Likely match"
     AMBIGUOUS_MATCH = "Ambiguous match"
     NOT_DETECTED = "Not detected"
+    OUTSIDE_FOV = "Outside FOV"
     INSUFFICIENT_DATA = "Insufficient data"
+
+class TrajectoryQualityStatus(str, Enum):
+    STRONG_MATCH = "STRONG MATCH"
+    REVIEW_NEEDED = "REVIEW NEEDED"
+    AMBIGUOUS = "AMBIGUOUS"
+    INSUFFICIENT_DATA = "INSUFFICIENT DATA"
+
+class FitModelType(str, Enum):
+    STATIONARY = "Stationary Source"
+    LINEAR_MOTION = "Linear Apparent Motion"
+    DISPLACEMENT_ONLY = "Displacement Only (Unverified Kinematics)"
+    SINGLE_POINT = "Single Epoch Reference"
+    NONE = "None"
 
 class MatchedEpoch(BaseModel):
     observation_id: str
+    dataset_id: Optional[str] = None
     date_obs: Optional[str] = None
     mjd_obs: Optional[float] = None
     time_delta_days: Optional[float] = None
@@ -19,14 +34,56 @@ class MatchedEpoch(BaseModel):
     dec_deg: Optional[float] = None
     separation_arcsec: Optional[float] = Field(None, description="Angular separation from reference source")
     separation_sigma: Optional[float] = Field(None, description="Separation normalized by combined positional error")
+    residual_arcsec: Optional[float] = Field(None, description="Residual from trajectory model fit in arcseconds")
+    residual_sigma: Optional[float] = Field(None, description="Residual normalized by measurement uncertainty")
     flux: Optional[float] = None
     flux_unit: str = "MJy/sr"
     snr: Optional[float] = None
+    fwhm_pixels: Optional[float] = None
+    band: Optional[str] = Field(None, description="SPHEREx spectral band / filter channel (e.g. LVF1)")
     status: MatchStatus
+    matched_source_id: Optional[str] = Field(None, description="Identifier of the matched source in target observation")
     candidate_count: int = Field(0, description="Number of candidate sources within search radius")
     confidence_score: float = Field(..., description="Documented heuristic score between 0.0 and 1.0 (not a calibrated probability)")
     confidence_rationale: str = Field(..., description="Plain-language scientific explanation of the score")
     position_uncertainty_arcsec: float = Field(0.5, description="Positional 1-sigma error ellipse radius")
+    is_measured: bool = Field(False, description="True only if supported by real detection in this epoch")
+
+class TrajectoryFitInfo(BaseModel):
+    fit_model: FitModelType
+    is_verified_motion: bool = Field(False, description="Strictly False if fewer than 3 suitable epochs")
+    proper_motion_mas_yr: Optional[float] = Field(None, description="Apparent velocity in milliarcsec/year")
+    proper_motion_uncertainty_mas_yr: Optional[float] = Field(None, description="1-sigma uncertainty on apparent velocity")
+    position_angle_deg: Optional[float] = Field(None, description="Position angle of motion vector in degrees East of North")
+    rms_residual_arcsec: Optional[float] = Field(None, description="Root-mean-square spatial residual in arcsec")
+    max_residual_sigma: Optional[float] = Field(None, description="Maximum normalized residual across all detections")
+    reduced_chi2: Optional[float] = Field(None, description="Reduced chi-squared goodness of fit")
+    degrees_of_freedom: Optional[int] = Field(None, description="Degrees of freedom in model fit")
+    fit_assessment: str = Field(..., description="Scientific plain-language evaluation of the model fit")
+
+class TrajectoryValidationInfo(BaseModel):
+    reference_catalog_or_service: str = "SPHEREx Internal Multi-Epoch Astrometry"
+    is_validated: bool = False
+    validation_status: str = "Unvalidated generic source association"
+    validation_details: str = ""
+
+class MultiEpochTrack(BaseModel):
+    track_id: str
+    color: str
+    reference_observation_id: str
+    reference_source_id: str
+    reference_ra_deg: float
+    reference_dec_deg: float
+    reference_position_uncertainty_arcsec: float = 0.5
+    total_eligible_epochs: int
+    detected_epochs_count: int
+    missed_epochs_count: int
+    quality_status: TrajectoryQualityStatus
+    quality_rationale: str
+    fit_info: TrajectoryFitInfo
+    validation_info: TrajectoryValidationInfo
+    timeline: List[MatchedEpoch]
+    created_at: Optional[str] = None
 
 class SourceTrackResponse(BaseModel):
     reference_observation_id: str
@@ -39,6 +96,13 @@ class SourceTrackResponse(BaseModel):
     estimated_proper_motion_mas_yr: Optional[float] = Field(None, description="Apparent motion in milliarcseconds per year if >= 2 epochs")
     motion_direction_deg: Optional[float] = Field(None, description="Position angle of motion vector in degrees (East of North)")
     notes: List[str] = []
+
+class TrackSourceTaskRequest(BaseModel):
+    reference_observation_id: str
+    reference_source_id: str
+    matching_radius_arcsec: float = 45.0
+    observation_ids: Optional[List[str]] = None
+    track_id: Optional[str] = None
 
 class PredictionRequest(BaseModel):
     reference_observation_id: str

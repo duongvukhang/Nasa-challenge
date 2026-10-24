@@ -59,7 +59,7 @@ def get_detected_sources(
     observation_id: str,
     threshold_sigma: float = Query(3.5, ge=1.5, le=15.0, description="Detection threshold in standard deviations"),
     fwhm_pixels: float = Query(3.0, ge=1.0, le=20.0, description="Assumed Gaussian PSF FWHM in pixels"),
-    max_sources: int = Query(150, ge=5, le=500, description="Maximum number of candidate sources to return")
+    max_sources: int = Query(500, ge=5, le=2000, description="Maximum number of candidate sources to return")
 ):
     """
     Executes photutils point source detection and returns candidate source catalog with coordinates.

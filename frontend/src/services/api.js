@@ -64,6 +64,45 @@ export const api = {
     return res.json();
   },
 
+  async createTrackTask({ referenceObsId, referenceSourceId, matchingRadiusArcsec = 45.0, observationIds = null, trackId = null }) {
+    const payload = {
+      reference_observation_id: referenceObsId,
+      reference_source_id: referenceSourceId,
+      matching_radius_arcsec: matchingRadiusArcsec
+    };
+    if (observationIds) payload.observation_ids = observationIds;
+    if (trackId) payload.track_id = trackId;
+
+    const res = await fetch(`${API_BASE}/api/tracking/track`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: "Multi-epoch tracking failed" }));
+      throw new Error(err.detail || "Multi-epoch tracking task failed");
+    }
+    return res.json();
+  },
+
+  async listTracks() {
+    const res = await fetch(`${API_BASE}/api/tracking/tracks`);
+    if (!res.ok) throw new Error("Failed to list active tracks");
+    return res.json();
+  },
+
+  async getTrack(trackId) {
+    const res = await fetch(`${API_BASE}/api/tracking/tracks/${trackId}`);
+    if (!res.ok) throw new Error(`Failed to fetch track ${trackId}`);
+    return res.json();
+  },
+
+  async deleteTrack(trackId) {
+    const res = await fetch(`${API_BASE}/api/tracking/tracks/${trackId}`, { method: "DELETE" });
+    if (!res.ok) throw new Error(`Failed to delete track ${trackId}`);
+    return res.json();
+  },
+
   async extractSpectrum(obsId, location = {}) {
     const query = new URLSearchParams();
     if (location.pixel_x !== undefined) query.append("pixel_x", location.pixel_x.toString());
@@ -120,24 +159,56 @@ export const api = {
     const query = new URLSearchParams();
     query.append("ra_deg", params.ra_deg.toString());
     query.append("dec_deg", params.dec_deg.toString());
-    query.append("radius_arcmin", params.radius_arcmin.toString());
-    if (params.band) query.append("band", params.band);
+    query.append("radius", (params.radius ?? params.radius_arcmin ?? 5.0).toString());
+    query.append("radius_unit", params.radius_unit || "arcmin");
+    if (params.start_date) query.append("start_date", params.start_date);
+    if (params.end_date) query.append("end_date", params.end_date);
+    if (params.band && params.band !== "ALL") query.append("band", params.band);
+    if (params.product_type) query.append("product_type", params.product_type);
     if (params.max_records) query.append("max_records", params.max_records.toString());
 
     const res = await fetch(`${API_BASE}/api/archive/search?${query.toString()}`);
-    if (!res.ok) throw new Error("IRSA SPHEREx archive search failed");
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: "IRSA search failed" }));
+      throw new Error(err.detail || "IRSA SPHEREx archive search failed");
+    }
     return res.json();
   },
 
-  async fetchArchiveObservation(obs_id, access_url) {
+  async fetchArchiveObservation(obs_id, access_url, band = null) {
     const res = await fetch(`${API_BASE}/api/archive/fetch`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ obs_id, access_url })
+      body: JSON.stringify({ obs_id, access_url, band })
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({ detail: "Fetch failed" }));
       throw new Error(err.detail || "Failed to fetch from IRSA archive");
+    }
+    return res.json();
+  },
+
+  async loadArchiveInterval(params) {
+    const payload = {
+      ra_deg: parseFloat(params.ra_deg) || 0.0,
+      dec_deg: parseFloat(params.dec_deg) || 0.0,
+      radius: parseFloat(params.radius ?? params.radius_arcmin ?? 5.0),
+      radius_unit: params.radius_unit || "arcmin",
+      start_date: params.start_date || null,
+      end_date: params.end_date || null,
+      band: params.band && params.band !== "ALL" ? params.band : null,
+      product_type: params.product_type || "Level 2 Science FITS",
+      max_records: params.max_records || 50
+    };
+
+    const res = await fetch(`${API_BASE}/api/archive/load-interval`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: "Interval loading failed" }));
+      throw new Error(err.detail || "Failed to load observation interval from IRSA archive");
     }
     return res.json();
   },

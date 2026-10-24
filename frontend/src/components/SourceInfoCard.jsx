@@ -9,7 +9,11 @@ import {
   TrendingUp,
   Info,
   CheckCircle2,
-  AlertTriangle
+  AlertTriangle,
+  Loader2,
+  Search,
+  Trash2,
+  Maximize2
 } from "lucide-react";
 
 export const SourceInfoCard = ({
@@ -18,10 +22,19 @@ export const SourceInfoCard = ({
   onClose,
   onOpenSpectrum,
   onOpenPrediction,
-  trackData = null
+  trackData = null,
+  activeTrack = null,
+  onTrackSource = null,
+  onInspectTrack = null,
+  onOpenSkyPlot = null,
+  isTrackingLoading = false,
+  onInspectSource = null,
+  onDeleteSource = null,
+  onCenterSource = null
 }) => {
   const [isPinned, setIsPinned] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
+  const [showConfirmDelete, setShowConfirmDelete] = useState(false);
 
   if (!source) return null;
 
@@ -62,6 +75,24 @@ export const SourceInfoCard = ({
           </div>
 
           <div className="flex items-center space-x-1">
+            {onInspectSource && (
+              <button
+                onClick={() => onInspectSource(source)}
+                className="p-1 rounded hover:bg-white/10 text-cyan-400 hover:text-cyan-200 transition-colors"
+                title="Inspect Object Details"
+              >
+                <Search className="w-3.5 h-3.5" />
+              </button>
+            )}
+            {onDeleteSource && (
+              <button
+                onClick={() => setShowConfirmDelete(true)}
+                className="p-1 rounded hover:bg-red-950/60 text-slate-400 hover:text-red-300 transition-colors"
+                title="Delete Object"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+              </button>
+            )}
             <button
               onClick={() => setIsPinned(!isPinned)}
               className={`p-1 rounded hover:bg-white/10 transition-colors ${
@@ -80,6 +111,30 @@ export const SourceInfoCard = ({
             </button>
           </div>
         </div>
+
+        {/* Delete Confirmation Alert if triggered */}
+        {showConfirmDelete && (
+          <div className="bg-red-950/80 p-2.5 rounded-lg border border-red-500/50 flex items-center justify-between text-[11px] font-sans text-red-200">
+            <span>Delete {source.id}?</span>
+            <div className="flex items-center space-x-1.5">
+              <button
+                onClick={() => {
+                  onDeleteSource(source.id);
+                  setShowConfirmDelete(false);
+                }}
+                className="px-2 py-0.5 rounded bg-red-600 hover:bg-red-500 text-white font-bold"
+              >
+                Delete
+              </button>
+              <button
+                onClick={() => setShowConfirmDelete(false)}
+                className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Astrometric Coordinates */}
         <div className="space-y-1 bg-black/40 p-2.5 rounded-lg border border-white/5 text-[11px]">
@@ -141,8 +196,89 @@ export const SourceInfoCard = ({
           )}
         </div>
 
+        {/* Multi-Epoch Trajectory Action / Status */}
+        {activeTrack ? (
+          <div className="bg-cyan-950/40 p-2.5 rounded-lg border border-cyan-500/30 space-y-2 text-[11px]">
+            <div className="flex items-center justify-between">
+              <span className="font-bold text-white flex items-center space-x-1.5">
+                <span
+                  className="w-2.5 h-2.5 rounded-full inline-block"
+                  style={{ backgroundColor: activeTrack.color || "#22d3ee" }}
+                />
+                <span>{activeTrack.track_id}</span>
+              </span>
+              <span
+                className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                  activeTrack.quality_status === "STRONG MATCH"
+                    ? "bg-emerald-500/20 text-emerald-300"
+                    : activeTrack.quality_status === "REVIEW NEEDED"
+                    ? "bg-amber-500/20 text-amber-300"
+                    : "bg-rose-500/20 text-rose-300"
+                }`}
+              >
+                {activeTrack.quality_status}
+              </span>
+            </div>
+
+            <div className="flex items-center space-x-2 pt-1">
+              <button
+                onClick={() => onInspectTrack?.(activeTrack)}
+                className="flex-1 py-1.5 px-2 rounded-md bg-cyan-900/60 hover:bg-cyan-800 border border-cyan-500/40 text-cyan-200 transition-colors flex items-center justify-center space-x-1 text-[11px]"
+              >
+                <Compass className="w-3.5 h-3.5 text-cyan-400" />
+                <span>Inspect Quality</span>
+              </button>
+              <button
+                onClick={() => onOpenSkyPlot?.(activeTrack)}
+                className="py-1.5 px-2 rounded-md bg-slate-800 hover:bg-slate-700 border border-white/10 text-slate-200 transition-colors flex items-center justify-center text-[11px]"
+                title="View Sky-Coordinate Plot"
+              >
+                <span>Sky Plot</span>
+              </button>
+            </div>
+          </div>
+        ) : onTrackSource ? (
+          <button
+            onClick={() => onTrackSource(source)}
+            disabled={isTrackingLoading}
+            className="w-full py-2 px-3 rounded-lg bg-gradient-to-r from-cyan-950 to-blue-950 hover:from-cyan-900 hover:to-blue-900 border border-cyan-500/50 text-cyan-200 transition-all flex items-center justify-center space-x-2 text-xs font-sans font-bold shadow-cyan-glow/20 disabled:opacity-50"
+          >
+            {isTrackingLoading ? (
+              <>
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-cyan-400" />
+                <span>Tracking Across Epochs...</span>
+              </>
+            ) : (
+              <>
+                <Compass className="w-3.5 h-3.5 text-cyan-400" />
+                <span>Track Across Epochs</span>
+              </>
+            )}
+          </button>
+        ) : null}
+
         {/* Quick Action Triggers */}
         <div className="grid grid-cols-2 gap-2 pt-1">
+          {onInspectSource && (
+            <button
+              onClick={() => onInspectSource(source)}
+              className="p-2 rounded-lg bg-cyan-950/90 hover:bg-cyan-900 border border-cyan-500/50 text-cyan-200 transition-colors flex items-center justify-center space-x-1.5 text-[11px] shadow-cyan-glow/20"
+            >
+              <Search className="w-3.5 h-3.5 text-cyan-400" />
+              <span>Inspect Object</span>
+            </button>
+          )}
+
+          {onCenterSource && (
+            <button
+              onClick={() => onCenterSource(source)}
+              className="p-2 rounded-lg bg-slate-900/80 hover:bg-slate-800 border border-white/10 text-slate-200 transition-colors flex items-center justify-center space-x-1.5 text-[11px]"
+            >
+              <Maximize2 className="w-3.5 h-3.5 text-slate-300" />
+              <span>Center View</span>
+            </button>
+          )}
+
           <button
             onClick={onOpenSpectrum}
             className="p-2 rounded-lg bg-cyan-950/70 hover:bg-cyan-900 border border-cyan-700/60 text-cyan-200 transition-colors flex items-center justify-center space-x-1.5 text-[11px]"
