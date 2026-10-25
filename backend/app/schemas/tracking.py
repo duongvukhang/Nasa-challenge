@@ -80,6 +80,7 @@ class TrajectoryValidationInfo(BaseModel):
 
 class MultiEpochTrack(BaseModel):
     track_id: str
+    display_name: Optional[str] = Field(None, description="Persistent human-readable label such as 'Track 001' or 'Candidate 001'")
     color: str
     reference_observation_id: str
     reference_source_id: str
@@ -117,6 +118,7 @@ class TrackSourceTaskRequest(BaseModel):
     motion_prior: str = Field("slow_mover", description="'static' (<=0.1'/d), 'slow_mover' (<=3.0'/d), or 'fast_mover' (<=30.0'/d)")
     observation_ids: Optional[List[str]] = None
     track_id: Optional[str] = None
+    display_name: Optional[str] = Field(None, description="Optional persistent display name such as 'Track 001' or 'Candidate 001'")
 
 class AcceptCandidateRequest(BaseModel):
     observation_id: str

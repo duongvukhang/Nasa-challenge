@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import {
   X,
+  XCircle,
   Crosshair,
   Trash2,
   Maximize2,
@@ -26,7 +27,8 @@ export const ObjectInspectorModal = ({
   onCenterSource,
   onOpenSpectrum,
   onOpenPrediction,
-  onTrackSource
+  onTrackSource,
+  onStopInspectTrack = null
 }) => {
   const [confirmDelete, setConfirmDelete] = useState(false);
 
@@ -74,13 +76,15 @@ export const ObjectInspectorModal = ({
             </div>
             <div>
               <div className="flex items-center space-x-2">
-                <span className="text-white font-bold text-sm tracking-wide">{source.id}</span>
+                <span className="text-white font-bold text-sm tracking-wide">
+                  {activeTrack ? (activeTrack.display_name || activeTrack.track_id) : source.id}
+                </span>
                 <span className="px-2 py-0.5 rounded-full text-[10px] font-sans font-medium bg-cyan-950 text-cyan-300 border border-cyan-500/30">
                   {source.is_tracked_target ? "Tracked Target" : "Detected Celestial Source"}
                 </span>
                 {activeTrack && (
                   <span className="px-2 py-0.5 rounded-full text-[10px] font-sans font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                    Track: {activeTrack.track_id}
+                    Detection: {source.id}
                   </span>
                 )}
               </div>
@@ -143,7 +147,13 @@ export const ObjectInspectorModal = ({
               </div>
             </div>
 
-            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 pt-1 text-[11px]">
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1 text-[11px]">
+              <div>
+                <span className="text-slate-400 font-sans block">Detection ID:</span>
+                <span className="text-cyan-300 font-mono font-bold truncate block" title={source.id}>
+                  {source.id}
+                </span>
+              </div>
               <div>
                 <span className="text-slate-400 font-sans block">Focal-Plane Pixel:</span>
                 <span className="text-white font-bold">
@@ -224,7 +234,10 @@ export const ObjectInspectorModal = ({
               <div className="bg-cyan-950/30 p-3 rounded-lg border border-cyan-500/30 flex items-center justify-between text-xs">
                 <div>
                   <div className="flex items-center space-x-2">
-                    <span className="font-bold text-white">{activeTrack.track_id}</span>
+                    <span className="font-bold text-white">{activeTrack.display_name || activeTrack.track_id}</span>
+                    {activeTrack.display_name && activeTrack.display_name !== activeTrack.track_id && (
+                      <span className="text-[10px] text-slate-400 font-sans">({activeTrack.track_id})</span>
+                    )}
                     <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-emerald-500/20 text-emerald-300">
                       {activeTrack.quality_status}
                     </span>
@@ -234,16 +247,28 @@ export const ObjectInspectorModal = ({
                   </p>
                 </div>
 
-                {activeTrack.fit_info?.proper_motion_mas_yr != null && (
-                  <div className="text-right">
-                    <span className="text-cyan-300 font-bold block">
-                      ~{activeTrack.fit_info.proper_motion_mas_yr.toFixed(1)} mas/yr
-                    </span>
-                    <span className="text-[10px] text-slate-400">
-                      PA: {activeTrack.fit_info.position_angle_deg?.toFixed(1) || 0}°
-                    </span>
-                  </div>
-                )}
+                <div className="flex items-center space-x-2">
+                  {onStopInspectTrack && (
+                    <button
+                      onClick={() => onStopInspectTrack(activeTrack.track_id)}
+                      className="px-2.5 py-1 rounded-md bg-rose-950/60 hover:bg-rose-900 border border-rose-500/40 text-rose-300 transition-colors text-xs font-sans font-medium flex items-center space-x-1"
+                      title="Delete trajectory and remove dots from viewer"
+                    >
+                      <Trash2 className="w-3.5 h-3.5 text-rose-400" />
+                      <span>Remove Trajectory</span>
+                    </button>
+                  )}
+                  {activeTrack.fit_info?.proper_motion_mas_yr != null && (
+                    <div className="text-right">
+                      <span className="text-cyan-300 font-bold block">
+                        ~{activeTrack.fit_info.proper_motion_mas_yr.toFixed(1)} mas/yr
+                      </span>
+                      <span className="text-[10px] text-slate-400">
+                        PA: {activeTrack.fit_info.position_angle_deg?.toFixed(1) || 0}°
+                      </span>
+                    </div>
+                  )}
+                </div>
               </div>
             ) : (
               <div className="flex items-center justify-between text-xs p-2.5 bg-white/5 rounded-lg border border-white/5">

@@ -136,9 +136,14 @@ export const TrackListPanel = ({
                         className="w-3.5 h-3.5 rounded-full"
                         style={{ backgroundColor: color, boxShadow: `0 0 6px ${color}` }}
                       />
-                      <span className="font-bold text-white text-xs">{tr.track_id}</span>
+                      <span className="font-bold text-white text-xs">{tr.display_name || tr.track_id}</span>
                       {renderStatusBadge(tr.quality_status)}
                     </div>
+                    {tr.display_name && tr.display_name !== tr.track_id && (
+                      <span className="text-[10px] text-slate-400 font-sans block pl-5 mb-1 truncate max-w-[200px]">
+                        ID: {tr.track_id}
+                      </span>
+                    )}
 
                     <div className="flex items-center space-x-1" onClick={(e) => e.stopPropagation()}>
                       <button

@@ -178,6 +178,8 @@ class TrajectoryService:
                     data = json.load(f)
                     for tr_dict in data:
                         tr = MultiEpochTrack(**tr_dict)
+                        if not tr.display_name:
+                            tr.display_name = f"Track {len(self._tracks) + 1:03d}"
                         self._tracks[tr.track_id] = tr
             except Exception:
                 pass
@@ -227,6 +229,17 @@ class TrajectoryService:
         track_id = req.track_id or f"trk_{req.reference_observation_id}_{req.reference_source_id}"
         color = get_stable_track_color(track_id)
 
+        # Stable persistent display name: e.g. "Track 001" or Candidate 001
+        if req.display_name:
+            display_name = req.display_name
+        elif track_id in self._tracks and self._tracks[track_id].display_name:
+            display_name = self._tracks[track_id].display_name
+        elif req.track_id and not req.track_id.startswith("trk_"):
+            display_name = req.track_id
+        else:
+            track_num = len(self._tracks) + 1
+            display_name = f"Track {track_num:03d}"
+
         # Handle absent or invalid celestial WCS in reference epoch
         if not ref_meta.wcs.has_wcs or ref_obs_record["wcs"] is None:
             fit_info = TrajectoryFitInfo(
@@ -251,6 +264,7 @@ class TrajectoryService:
             )
             track = MultiEpochTrack(
                 track_id=track_id,
+                display_name=display_name,
                 color=color,
                 reference_observation_id=req.reference_observation_id,
                 reference_source_id=req.reference_source_id,
@@ -636,6 +650,7 @@ class TrajectoryService:
 
         track = MultiEpochTrack(
             track_id=track_id,
+            display_name=display_name,
             color=color,
             reference_observation_id=req.reference_observation_id,
             reference_source_id=req.reference_source_id,

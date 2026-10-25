@@ -7,6 +7,7 @@ import {
   Activity,
   Compass,
   X,
+  XCircle,
   ChevronRight,
   Sparkles,
   ShieldAlert
@@ -21,7 +22,8 @@ export const SelectedObjectManager = ({
   onCenter,
   onTrack,
   onOpenSpectrum,
-  onDeselect
+  onDeselect,
+  onStopInspectTrack = null
 }) => {
   const [showConfirm, setShowConfirm] = useState(false);
 
@@ -38,10 +40,12 @@ export const SelectedObjectManager = ({
           </div>
           <div>
             <div className="flex items-center space-x-1.5">
-              <span className="font-bold text-white tracking-wide">{selectedSource.id}</span>
+              <span className="font-bold text-white tracking-wide">
+                {activeTrack ? (activeTrack.display_name || activeTrack.track_id) : selectedSource.id}
+              </span>
               {activeTrack && (
-                <span className="px-1.5 py-0.2 rounded text-[9px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                  {activeTrack.track_id}
+                <span className="px-1.5 py-0.2 rounded text-[9px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30" title="Detection ID">
+                  {selectedSource.id}
                 </span>
               )}
             </div>
@@ -102,6 +106,18 @@ export const SelectedObjectManager = ({
                 title="View infrared spectrum"
               >
                 <Activity className="w-4 h-4" />
+              </button>
+            )}
+
+            {/* Remove Trajectory */}
+            {activeTrack && onStopInspectTrack && (
+              <button
+                onClick={() => onStopInspectTrack(activeTrack.track_id)}
+                className="px-2 py-1.5 rounded-xl bg-rose-950/60 hover:bg-rose-900/80 border border-rose-500/40 text-rose-300 hover:text-rose-200 transition-colors flex items-center space-x-1 text-xs"
+                title="Delete trajectory and remove dots from viewer"
+              >
+                <Trash2 className="w-3.5 h-3.5 text-rose-400" />
+                <span className="hidden sm:inline">Remove Trajectory</span>
               </button>
             )}
 

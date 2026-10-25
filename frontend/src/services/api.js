@@ -103,6 +103,12 @@ export const api = {
     return res.json();
   },
 
+  async clearTracks() {
+    const res = await fetch(`${API_BASE}/api/tracking/tracks`, { method: "DELETE" });
+    if (!res.ok) throw new Error("Failed to clear tracks");
+    return res.json();
+  },
+
   async undoTrack(trackId) {
     const res = await fetch(`${API_BASE}/api/tracking/tracks/${trackId}/undo`, { method: "POST" });
     if (!res.ok) throw new Error(`Failed to undo action on track ${trackId}`);

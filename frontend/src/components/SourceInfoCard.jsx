@@ -2,6 +2,7 @@ import React, { useState } from "react";
 import {
   Crosshair,
   X,
+  XCircle,
   Pin,
   PinOff,
   Activity,
@@ -30,7 +31,8 @@ export const SourceInfoCard = ({
   isTrackingLoading = false,
   onInspectSource = null,
   onDeleteSource = null,
-  onCenterSource = null
+  onCenterSource = null,
+  onStopInspectTrack = null
 }) => {
   const [isPinned, setIsPinned] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
@@ -69,8 +71,19 @@ export const SourceInfoCard = ({
               <Crosshair className="w-3.5 h-3.5" />
             </div>
             <div>
-              <span className="font-bold text-white text-xs block">{source.id}</span>
-              <span className="text-[10px] text-cyan-400 font-sans">SPHEREx Candidate Source</span>
+              <div className="flex items-center space-x-1.5">
+                <span className="font-bold text-white text-xs block">
+                  {activeTrack ? (activeTrack.display_name || activeTrack.track_id) : source.id}
+                </span>
+                {activeTrack && (
+                  <span className="px-1.5 py-0.2 rounded text-[9px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                    Tracked
+                  </span>
+                )}
+              </div>
+              <span className="text-[10px] text-cyan-400 font-sans block truncate max-w-[180px]">
+                {activeTrack ? `Detection: ${source.id}` : "SPHEREx Candidate Source"}
+              </span>
             </div>
           </div>
 
@@ -205,7 +218,7 @@ export const SourceInfoCard = ({
                   className="w-2.5 h-2.5 rounded-full inline-block"
                   style={{ backgroundColor: activeTrack.color || "#22d3ee" }}
                 />
-                <span>{activeTrack.track_id}</span>
+                <span>{activeTrack.display_name || activeTrack.track_id}</span>
               </span>
               <span
                 className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
@@ -236,6 +249,17 @@ export const SourceInfoCard = ({
                 <span>Sky Plot</span>
               </button>
             </div>
+
+            {onStopInspectTrack && (
+              <button
+                onClick={() => onStopInspectTrack(activeTrack.track_id)}
+                className="w-full py-1.5 px-2 rounded-md bg-rose-950/40 hover:bg-rose-900/60 border border-rose-500/30 text-rose-300 hover:text-rose-100 transition-colors flex items-center justify-center space-x-1.5 text-[11px] font-sans font-medium"
+                title="Delete trajectory and remove dots from viewer"
+              >
+                <Trash2 className="w-3.5 h-3.5 text-rose-400" />
+                <span>Remove Trajectory & Dots</span>
+              </button>
+            )}
           </div>
         ) : onTrackSource ? (
           <button

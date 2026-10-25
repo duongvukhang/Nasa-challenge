@@ -75,6 +75,14 @@ def get_track_by_id(track_id: str):
         raise HTTPException(status_code=404, detail=f"Track '{track_id}' not found.")
     return track
 
+@router.delete("/tracks")
+def clear_all_tracks():
+    """
+    Clears all active multi-epoch source tracks.
+    """
+    count = trajectory_service.clear_tracks()
+    return {"status": "success", "cleared_count": count}
+
 @router.delete("/tracks/{track_id}")
 def delete_track_by_id(track_id: str):
     """
@@ -140,7 +148,10 @@ def export_track_data(
         writer = csv.writer(output)
         writer.writerow([
             "track_id",
+            "display_name",
             "observation_id",
+            "detection_id",
+            "matched_source_id",
             "date_obs",
             "mjd_obs",
             "kind",
@@ -160,9 +171,13 @@ def export_track_data(
         ])
         for ep in track.timeline:
             kind = "measured" if ep.is_measured else ("missing" if ep.status in [MatchStatus.NOT_DETECTED, MatchStatus.OUTSIDE_FOV] else "unverified")
+            det_id = ep.matched_source_id or ""
             writer.writerow([
                 track.track_id,
+                track.display_name or track.track_id,
                 ep.observation_id,
+                det_id,
+                det_id,
                 ep.date_obs or "",
                 ep.mjd_obs if ep.mjd_obs is not None else "",
                 kind,
@@ -189,8 +204,10 @@ def export_track_data(
 
     # JSON export
     data = track.model_dump()
+    data["display_name"] = track.display_name or track.track_id
     for ep in data["timeline"]:
         ep["kind"] = "measured" if ep.get("is_measured") else ("missing" if ep.get("status") in [MatchStatus.NOT_DETECTED.value, MatchStatus.OUTSIDE_FOV.value] else "unverified")
+        ep["detection_id"] = ep.get("matched_source_id")
 
     return Response(
         content=json.dumps(data, indent=2),

@@ -144,7 +144,7 @@ export const SkyPlotModal = ({
             <div>
               <div className="flex items-center space-x-2">
                 <span className="text-white font-bold text-sm">Historical Sky-Coordinate Plot</span>
-                <span className="text-xs text-cyan-300 font-sans">{track.track_id}</span>
+                <span className="text-xs text-cyan-300 font-sans">{track.display_name || track.track_id}</span>
               </div>
               <p className="text-[11px] text-slate-400 font-sans">
                 Measured positions across {measuredPoints.length} confirmed epochs with 1σ error bars

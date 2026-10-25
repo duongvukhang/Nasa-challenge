@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import {
   X,
+  XCircle,
   Compass,
   CheckCircle2,
   AlertTriangle,
@@ -30,7 +31,8 @@ export const TrajectoryInspector = ({
   onFocusTrack,
   onDeleteTrack,
   onSelectObservation,
-  onUpdateTrack = null
+  onUpdateTrack = null,
+  onStopInspect = null
 }) => {
   const [activeTab, setActiveTab] = useState("timeline"); // "timeline" | "fit" | "missed"
 
@@ -92,7 +94,10 @@ export const TrajectoryInspector = ({
             />
             <div>
               <div className="flex items-center space-x-2">
-                <span className="text-white font-bold text-sm tracking-wide">{track.track_id}</span>
+                <span className="text-white font-bold text-sm tracking-wide">{track.display_name || track.track_id}</span>
+                {track.display_name && track.display_name !== track.track_id && (
+                  <span className="text-[11px] text-slate-400 font-sans">({track.track_id})</span>
+                )}
                 {renderStatusBadge(track.quality_status)}
                 <span className="text-xs text-slate-400 font-sans">
                   Ref: <span className="text-cyan-300">{track.reference_source_id}</span> ({track.reference_observation_id})
@@ -173,6 +178,19 @@ export const TrajectoryInspector = ({
               <Maximize2 className="w-3.5 h-3.5 text-slate-300" />
               <span>Focus</span>
             </button>
+            {onStopInspect && (
+              <button
+                onClick={() => {
+                  onStopInspect(track.track_id);
+                  onClose();
+                }}
+                className="px-2.5 py-1 rounded-lg bg-rose-950/70 hover:bg-rose-900 border border-rose-500/50 text-rose-200 transition-colors flex items-center space-x-1.5 text-xs font-bold"
+                title="Remove trajectory and dots from viewer"
+              >
+                <Trash2 className="w-3.5 h-3.5 text-rose-400" />
+                <span>Remove Trajectory</span>
+              </button>
+            )}
             {onDeleteTrack && (
               <button
                 onClick={() => {
@@ -336,6 +354,11 @@ export const TrajectoryInspector = ({
                           <span className="text-[10px] text-slate-500 block truncate max-w-[120px]">
                             {ep.observation_id}
                           </span>
+                          {ep.matched_source_id && (
+                            <span className="text-[10px] text-cyan-400 font-mono block truncate max-w-[140px]" title={`Detection ID: ${ep.matched_source_id}`}>
+                              {ep.matched_source_id}
+                            </span>
+                          )}
                         </td>
 
                         <td className="py-2 px-2 whitespace-nowrap">
@@ -598,12 +621,27 @@ export const TrajectoryInspector = ({
           <div className="text-[11px] text-slate-400 font-sans">
             Created: {track.created_at ? new Date(track.created_at).toLocaleTimeString() : "Current session"}
           </div>
-          <button
-            onClick={onClose}
-            className="px-4 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-white font-sans text-xs transition-colors"
-          >
-            Close
-          </button>
+          <div className="flex items-center space-x-2">
+            {onStopInspect && (
+              <button
+                onClick={() => {
+                  onStopInspect(track.track_id);
+                  onClose();
+                }}
+                className="px-3 py-1.5 rounded-lg bg-rose-950/70 hover:bg-rose-900 border border-rose-500/50 text-rose-200 font-sans text-xs font-semibold flex items-center space-x-1.5 transition-colors"
+                title="Remove trajectory and dots from viewer"
+              >
+                <Trash2 className="w-3.5 h-3.5 text-rose-400" />
+                <span>Remove Trajectory & Dots</span>
+              </button>
+            )}
+            <button
+              onClick={onClose}
+              className="px-4 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-white font-sans text-xs transition-colors"
+            >
+              Close
+            </button>
+          </div>
         </div>
 
       </div>

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { TopToolbar } from "./components/TopToolbar";
 import { Sidebar } from "./components/Sidebar";
 import { SkyViewer } from "./components/SkyViewer";
@@ -210,7 +210,27 @@ export const App = () => {
     [activeTrackId]
   );
 
-  const handleClearTracks = useCallback(() => {
+  const handleStopInspectTrack = useCallback(
+    async (trackId = null) => {
+      const targetId = trackId || activeTrackId || inspectingTrack?.track_id;
+      setIsTrackInspectorOpen(false);
+      if (targetId) {
+        await handleDeleteTrack(targetId);
+      } else {
+        setTracks({});
+        setActiveTrackId(null);
+        setTrackData(null);
+        setInspectingTrack(null);
+      }
+      showToast("Trajectory and dots removed", "info");
+    },
+    [activeTrackId, inspectingTrack, handleDeleteTrack]
+  );
+
+  const handleClearTracks = useCallback(async () => {
+    try {
+      await api.clearTracks();
+    } catch (_) {}
     setTracks({});
     setActiveTrackId(null);
     setTrackData(null);
@@ -297,17 +317,42 @@ export const App = () => {
     [activeObservationId]
   );
 
+  // Determine the active track associated with the selected source in the current observation
+  const selectedSourceTrack = useMemo(() => {
+    if (!selectedSource || !activeObservationId) return null;
+    const trackList = Object.values(tracks);
+    for (const tr of trackList) {
+      const epMatch = tr?.timeline?.find((ep) => ep.observation_id === activeObservationId);
+      if (epMatch?.is_measured && epMatch.matched_source_id === selectedSource.id && epMatch.status === "Likely match") {
+        return tr;
+      }
+    }
+    return activeTrackId && tracks[activeTrackId] ? tracks[activeTrackId] : trackData;
+  }, [selectedSource, activeObservationId, tracks, activeTrackId, trackData]);
+
   // Switch observation epoch WITHOUT resetting the user's selected object or track data
   const handleSelectObservation = useCallback((obsId) => {
     if (obsId === activeObservationId) return;
     setActiveObservationId(obsId);
   }, [activeObservationId]);
 
-  // Load and refresh observations
+  // Load and refresh observations and persisted tracks
   const refreshObservations = useCallback(async (selectId = null) => {
     try {
-      const list = await api.listObservations();
+      const [list, loadedTracks] = await Promise.all([
+        api.listObservations(),
+        api.listTracks().catch(() => [])
+      ]);
       setObservations(list);
+      if (Array.isArray(loadedTracks) && loadedTracks.length > 0) {
+        const tracksMap = {};
+        loadedTracks.forEach((tr) => {
+          if (tr?.track_id) {
+            tracksMap[tr.track_id] = tr;
+          }
+        });
+        setTracks(tracksMap);
+      }
       if (list.length > 0) {
         const targetId = selectId && list.some((o) => o.observation_id === selectId)
           ? selectId
@@ -384,82 +429,24 @@ export const App = () => {
             const detected = (res.sources || []).filter((s) => !excludedSourceIds.has(s.id));
             setSources(detected);
 
-            const target = trackedTargetRef.current;
-            if (target) {
-              let matched = null;
-
-              // 1. Match from trackData timeline for this observation
-              if (trackData?.timeline) {
-                const epMatch = trackData.timeline.find((ep) => ep.observation_id === activeObservationId);
-                if (epMatch?.matched_source_id) {
-                  matched = detected.find((s) => s.id === epMatch.matched_source_id);
-                }
-                if (!matched && epMatch?.pixel_x != null && epMatch?.pixel_y != null) {
-                  let bestDist = Infinity;
-                  for (const s of detected) {
-                    const dist = Math.hypot(s.pixel_x - epMatch.pixel_x, s.pixel_y - epMatch.pixel_y);
-                    if (dist < bestDist && dist < 12.0) {
-                      bestDist = dist;
-                      matched = s;
-                    }
-                  }
-                }
-              }
-
-              // 2. Match by sky coordinates if available
-              if (!matched && target.ra != null && target.dec != null) {
-                let bestSep = Infinity;
-                for (const s of detected) {
-                  if (s.ra_deg != null && s.dec_deg != null) {
-                    const cosDec = Math.cos((target.dec * Math.PI) / 180) || 1;
-                    const dra = (s.ra_deg - target.ra) * cosDec;
-                    const ddec = s.dec_deg - target.dec;
-                    const sepArcsec = Math.hypot(dra, ddec) * 3600;
-                    if (sepArcsec < bestSep && sepArcsec < 45.0) {
-                      bestSep = sepArcsec;
-                      matched = s;
-                    }
-                  }
-                }
-              }
-
-              // 3. Match by pixel distance fallback
-              if (!matched && target.pixelX != null && target.pixelY != null) {
-                let bestDist = Infinity;
-                for (const s of detected) {
-                  const dist = Math.hypot(s.pixel_x - target.pixelX, s.pixel_y - target.pixelY);
-                  if (dist < bestDist && dist < 15.0) {
-                    bestDist = dist;
-                    matched = s;
-                  }
-                }
-              }
-
-              if (matched) {
-                setSelectedSource(matched);
+            // Maintain tracked object association across epochs using tracking service associations
+            const currentTrack = (activeTrackId && tracks[activeTrackId]) || trackData;
+            if (currentTrack?.timeline) {
+              const epMatch = currentTrack.timeline.find((ep) => ep.observation_id === activeObservationId);
+              // Only confirmed/accepted detections associated with the track are selected
+              if (epMatch?.is_measured && epMatch.status === "Likely match" && epMatch.matched_source_id) {
+                const matched = detected.find((s) => s.id === epMatch.matched_source_id);
+                setSelectedSource(matched || null);
               } else {
-                // If not directly detected in this epoch, preserve tracked target placeholder
-                // Never arbitrarily fall back to detected[0]
-                setSelectedSource((prev) => {
-                  if (prev && !prev.is_tracked_target && detected.some((s) => s.id === prev.id)) {
-                    return prev;
-                  }
-                  return {
-                    id: target.id.includes("Tracking") ? target.id : `${target.id} (Tracking)`,
-                    pixel_x: target.pixelX,
-                    pixel_y: target.pixelY,
-                    ra_deg: target.ra,
-                    dec_deg: target.dec,
-                    peak_flux: 0,
-                    flux_unit: "MJy/sr",
-                    snr: null,
-                    is_tracked_target: true
-                  };
-                });
+                // When target is not detected, outside FOV, or ambiguous in this observation:
+                // Strictly do NOT create a fake detection or display predicted position as an observed source
+                setSelectedSource(null);
               }
-            } else {
-              // No user selection active
-              setSelectedSource(null);
+            } else if (trackedTargetRef.current) {
+              if (trackedTargetRef.current.obsId !== activeObservationId) {
+                setSelectedSource(null);
+                trackedTargetRef.current = null;
+              }
             }
           }
         })
@@ -471,19 +458,20 @@ export const App = () => {
     }, 150);
 
     return () => clearTimeout(timer);
-  }, [activeObservationId, detectionSettings, trackData, excludedSourceIds]);
+  }, [activeObservationId, detectionSettings, tracks, activeTrackId, trackData, excludedSourceIds]);
 
-  // Synchronize selected source when trackData finishes resolving
+  // Synchronize selected source when active track or trackData finishes resolving
   useEffect(() => {
-    if (!trackData || !activeObservationId || sources.length === 0) return;
-    const epMatch = trackData.timeline?.find((ep) => ep.observation_id === activeObservationId);
-    if (epMatch?.matched_source_id) {
+    const currentTrack = (activeTrackId && tracks[activeTrackId]) || trackData;
+    if (!currentTrack || !activeObservationId || sources.length === 0) return;
+    const epMatch = currentTrack.timeline?.find((ep) => ep.observation_id === activeObservationId);
+    if (epMatch?.is_measured && epMatch.status === "Likely match" && epMatch.matched_source_id) {
       const found = sources.find((s) => s.id === epMatch.matched_source_id);
       if (found && selectedSource?.id !== found.id) {
         setSelectedSource(found);
       }
     }
-  }, [trackData, activeObservationId, sources, selectedSource?.id]);
+  }, [tracks, activeTrackId, trackData, activeObservationId, sources, selectedSource?.id]);
 
   // Action handlers
   const handleUploadFits = async (file) => {
@@ -697,9 +685,10 @@ export const App = () => {
           onOpenSpectrum={() => setIsSpectrumOpen(true)}
           onOpenPrediction={() => setIsPredictionModalOpen(true)}
           trackData={trackData}
-          activeTrack={activeTrackId ? tracks[activeTrackId] : null}
+          activeTrack={selectedSourceTrack}
           onTrackSource={handleTrackSource}
           onInspectTrack={handleInspectTrack}
+          onStopInspectTrack={handleStopInspectTrack}
           onOpenSkyPlot={handleOpenSkyPlot}
           isTrackingLoading={isTrackingLoading}
           onInspectSource={handleInspectSource}
@@ -713,11 +702,12 @@ export const App = () => {
         <SelectedObjectManager
           selectedSource={selectedSource}
           observation={currentObs}
-          activeTrack={activeTrackId ? tracks[activeTrackId] : null}
+          activeTrack={selectedSourceTrack}
           onInspect={() => setIsObjectInspectorOpen(true)}
           onDelete={handleDeleteSource}
           onCenter={handleCenterOnSource}
           onTrack={handleTrackSource}
+          onStopInspectTrack={handleStopInspectTrack}
           onOpenSpectrum={() => setIsSpectrumOpen(true)}
           onDeselect={() => handleSelectSource(null)}
         />
@@ -729,12 +719,13 @@ export const App = () => {
         onClose={() => setIsObjectInspectorOpen(false)}
         source={selectedSource}
         observation={currentObs}
-        activeTrack={activeTrackId ? tracks[activeTrackId] : null}
+        activeTrack={selectedSourceTrack}
         onDeleteSource={handleDeleteSource}
         onCenterSource={handleCenterOnSource}
         onOpenSpectrum={() => setIsSpectrumOpen(true)}
         onOpenPrediction={() => setIsPredictionModalOpen(true)}
         onTrackSource={handleTrackSource}
+        onStopInspectTrack={handleStopInspectTrack}
       />
 
       {/* 7. Active Multi-Epoch Track List Panel */}
@@ -765,6 +756,7 @@ export const App = () => {
         }}
         onDeleteTrack={handleDeleteTrack}
         onSelectObservation={handleSelectObservation}
+        onStopInspect={handleStopInspectTrack}
         onUpdateTrack={(updated) => {
           setTracks((prev) => ({ ...prev, [updated.track_id]: updated }));
           setInspectingTrack(updated);

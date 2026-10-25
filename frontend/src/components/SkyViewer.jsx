@@ -167,6 +167,34 @@ export const SkyViewer = ({
     return allTrackList.filter((tr) => tr && !hiddenTrackIds.has(tr.track_id));
   }, [allTrackList, hiddenTrackIds]);
 
+  // Persistent identity mapping: map each matched_source_id in the current active observation
+  // to its track, persistent label, and confirmation status.
+  const sourceTrackMap = useMemo(() => {
+    const map = new Map();
+    if (!observation?.observation_id) return map;
+
+    for (const tr of visibleTrackList) {
+      if (!tr?.timeline) continue;
+      const currentEp = tr.timeline.find(
+        (ep) => ep.observation_id === observation.observation_id
+      );
+      if (!currentEp || !currentEp.is_measured || !currentEp.matched_source_id) continue;
+
+      const persistentLabel = tr.display_name || tr.track_id;
+      const isConfirmed = currentEp.status === "Likely match";
+      const isAmbiguous = currentEp.status === "Ambiguous match";
+
+      map.set(currentEp.matched_source_id, {
+        track: tr,
+        persistentLabel,
+        isConfirmed,
+        isAmbiguous,
+        epoch: currentEp
+      });
+    }
+    return map;
+  }, [visibleTrackList, observation?.observation_id]);
+
   // Clear projected coords map when active observation changes
   useEffect(() => {
     setProjectedCoordsMap({});
@@ -406,12 +434,12 @@ export const SkyViewer = ({
                           x2={pt.screenX}
                           y2={pt.screenY}
                           stroke={trackColor}
-                          strokeWidth={6}
-                          strokeOpacity={0.3}
+                          strokeWidth={2.5}
+                          strokeOpacity={0.25}
                           vectorEffect="non-scaling-stroke"
                         />
                       )}
-                      {/* Crisp trajectory line */}
+                      {/* Trajectory line */}
                       <line
                         x1={prev.screenX}
                         y1={prev.screenY}
@@ -458,17 +486,20 @@ export const SkyViewer = ({
             );
           })}
 
-          {/* Confirmed Detection Markers in Current Epoch (Truth-Based: Only when is_measured === true) */}
+          {/* Confirmed Detection Markers in Current Epoch (Truth-Based: Only when is_measured === true AND status === "Likely match") */}
           {visibleTrackList.map((tr) => {
             const trackColor = tr.color || getStableTrackColor(tr.track_id);
             const isActive = tr.track_id === activeTrackId;
             const currentEp = tr.timeline?.find((ep) => ep.observation_id === observation?.observation_id);
 
-            // Strictly do NOT fabricate marker if source is outside FOV or not detected in this epoch
-            if (!currentEp || !currentEp.is_measured) return null;
+            // Strictly do NOT fabricate marker if source is outside FOV, not detected, or unconfirmed/ambiguous in this epoch
+            if (!currentEp || !currentEp.is_measured || currentEp.status !== "Likely match") return null;
 
             const coords = getEpochScreenCoords(currentEp);
             if (!coords) return null;
+
+            const persistentLabel = tr.display_name || tr.track_id;
+            const isLabelAlreadyShown = overlaySettings.showSources && (overlaySettings.showLabels || currentEp.matched_source_id === selectedSource?.id);
 
             return (
               <g
@@ -476,6 +507,12 @@ export const SkyViewer = ({
                 onClick={(e) => {
                   e.stopPropagation();
                   onSelectTrack?.(tr.track_id);
+                  if (currentEp.matched_source_id) {
+                    const matchedSrc = sources.find((s) => s.id === currentEp.matched_source_id);
+                    if (matchedSrc) {
+                      onSelectSource(matchedSrc);
+                    }
+                  }
                 }}
                 className="cursor-pointer pointer-events-auto"
               >
@@ -512,18 +549,20 @@ export const SkyViewer = ({
                   strokeWidth={0.8}
                   vectorEffect="non-scaling-stroke"
                 />
-                {/* Track label */}
-                <text
-                  x={coords.x + (isActive ? 14 : 10)}
-                  y={coords.y - 4}
-                  fill={trackColor}
-                  fontSize={isActive ? 11 : 9}
-                  fontFamily="monospace"
-                  fontWeight={isActive ? "bold" : "normal"}
-                  className="pointer-events-none select-none drop-shadow"
-                >
-                  {tr.track_id}
-                </text>
+                {/* Persistent Track label (shown when source overlay is not displaying it) */}
+                {!isLabelAlreadyShown && (
+                  <text
+                    x={coords.x + (isActive ? 14 : 10)}
+                    y={coords.y - 4}
+                    fill={trackColor}
+                    fontSize={isActive ? 11 : 9}
+                    fontFamily="monospace"
+                    fontWeight={isActive ? "bold" : "normal"}
+                    className="pointer-events-none select-none drop-shadow"
+                  >
+                    {persistentLabel}
+                  </text>
+                )}
               </g>
             );
           })}
@@ -547,8 +586,8 @@ export const SkyViewer = ({
                       y1={p1.y}
                       x2={p2.x}
                       y2={p2.y}
-                      stroke="rgba(245, 158, 11, 0.3)"
-                      strokeWidth={4}
+                      stroke="rgba(245, 158, 11, 0.2)"
+                      strokeWidth={2}
                       vectorEffect="non-scaling-stroke"
                     />
                     <line
@@ -577,7 +616,7 @@ export const SkyViewer = ({
             </g>
           )}
 
-          {/* 4. Detected Sources Overlay — thin green squares only */}
+          {/* 4. Detected Sources Overlay — thin green squares with persistent track labels */}
           {overlaySettings.showSources &&
             sources.map((src) => {
               const screenX = src.pixel_x;
@@ -586,11 +625,23 @@ export const SkyViewer = ({
               const size = isSelected ? 18 : 10;
               const half = size / 2;
 
+              // Check persistent track association in active observation
+              const association = sourceTrackMap.get(src.id);
+              const isTrackedConfirmed = association && association.isConfirmed;
+              const trackColor = association?.track?.color || (association?.track ? getStableTrackColor(association.track.track_id) : null);
+              const isTrackActive = association?.track?.track_id === activeTrackId;
+
+              // Persistent track identity for confirmed associations; detection ID for unassociated/ambiguous sources
+              const displayLabel = isTrackedConfirmed ? association.persistentLabel : src.id;
+
               return (
                 <g
                   key={src.id}
                   onClick={(e) => {
                     e.stopPropagation();
+                    if (association?.track) {
+                      onSelectTrack?.(association.track.track_id);
+                    }
                     onSelectSource(src);
                   }}
                   className="cursor-pointer pointer-events-auto"
@@ -607,17 +658,18 @@ export const SkyViewer = ({
                     vectorEffect="non-scaling-stroke"
                   />
 
-                  {/* Source Label (When enabled or selected) */}
-                  {(overlaySettings.showLabels || isSelected) && (
+                  {/* Source Label (When enabled, selected, or confirmed track) */}
+                  {(overlaySettings.showLabels || isSelected || isTrackedConfirmed) && (
                     <text
                       x={screenX + half + 3}
                       y={screenY - half + 2}
-                      fill="#e2e8f0"
-                      fontSize={10}
+                      fill={isTrackedConfirmed ? (trackColor || "#38bdf8") : "#e2e8f0"}
+                      fontSize={isSelected || isTrackActive ? 11 : 10}
                       fontFamily="monospace"
-                      className="pointer-events-none select-none"
+                      fontWeight={isTrackedConfirmed || isSelected ? "bold" : "normal"}
+                      className="pointer-events-none select-none drop-shadow"
                     >
-                      {src.id}
+                      {displayLabel}
                     </text>
                   )}
                 </g>
