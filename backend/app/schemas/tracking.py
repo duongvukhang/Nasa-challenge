@@ -32,6 +32,9 @@ class MatchedEpoch(BaseModel):
     pixel_y: Optional[float] = None
     ra_deg: Optional[float] = None
     dec_deg: Optional[float] = None
+    predicted_ra_deg: Optional[float] = Field(None, description="Predicted sky RA in degrees from motion model")
+    predicted_dec_deg: Optional[float] = Field(None, description="Predicted sky Dec in degrees from motion model")
+    prediction_uncertainty_arcsec: Optional[float] = Field(None, description="1-sigma uncertainty on predicted position in arcseconds")
     separation_arcsec: Optional[float] = Field(None, description="Angular separation from reference source")
     separation_sigma: Optional[float] = Field(None, description="Separation normalized by combined positional error")
     residual_arcsec: Optional[float] = Field(None, description="Residual from trajectory model fit in arcseconds")

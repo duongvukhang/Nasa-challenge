@@ -380,6 +380,15 @@ export const TrajectoryInspector = ({
                                 ±{ep.position_uncertainty_arcsec?.toFixed(3) || "0.300"}″
                               </span>
                             </>
+                          ) : ep.predicted_ra_deg != null && ep.predicted_dec_deg != null ? (
+                            <>
+                              <span className="text-amber-400/90 block" title="Predicted position from motion extrapolation">
+                                {ep.predicted_ra_deg.toFixed(5)}°, {ep.predicted_dec_deg.toFixed(5)}°
+                              </span>
+                              <span className="text-amber-500/70 text-[10px]">
+                                Pred ±{ep.prediction_uncertainty_arcsec?.toFixed(2) || "—"}″
+                              </span>
+                            </>
                           ) : (
                             <span className="text-slate-500 italic">Not measured</span>
                           )}

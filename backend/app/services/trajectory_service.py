@@ -168,18 +168,39 @@ class TrajectoryService:
 
     def __init__(self):
         self._tracks: Dict[str, MultiEpochTrack] = {}
+        self._max_allocated_track_number: int = 0
         self._load_persisted_tracks()
+
+    def _allocate_display_name(self) -> str:
+        """
+        Allocates a monotonic, collision-safe display name like 'Track 001'.
+        Never reuses names of active or previously allocated tracks in the current session.
+        """
+        import re
+        max_num = self._max_allocated_track_number
+        for tr in self._tracks.values():
+            if tr.display_name:
+                m = re.match(r"^Track\s+(\d+)$", tr.display_name)
+                if m:
+                    max_num = max(max_num, int(m.group(1)))
+        self._max_allocated_track_number = max_num + 1
+        return f"Track {self._max_allocated_track_number:03d}"
 
     def _load_persisted_tracks(self):
         """Loads persisted tracks from disk on startup if available."""
         if TRACKS_STORE_PATH.exists():
             try:
+                import re
                 with open(TRACKS_STORE_PATH, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     for tr_dict in data:
                         tr = MultiEpochTrack(**tr_dict)
                         if not tr.display_name:
-                            tr.display_name = f"Track {len(self._tracks) + 1:03d}"
+                            tr.display_name = self._allocate_display_name()
+                        else:
+                            m = re.match(r"^Track\s+(\d+)$", tr.display_name)
+                            if m:
+                                self._max_allocated_track_number = max(self._max_allocated_track_number, int(m.group(1)))
                         self._tracks[tr.track_id] = tr
             except Exception:
                 pass
@@ -212,8 +233,123 @@ class TrajectoryService:
     def clear_tracks(self) -> int:
         count = len(self._tracks)
         self._tracks.clear()
+        self._max_allocated_track_number = 0
         self._save_tracks()
         return count
+
+    def _predict_position_for_epoch(
+        self,
+        target_mjd: float,
+        accepted_pts: List[Dict[str, Any]],
+        prior_rate: float,
+        base_radius: float
+    ) -> Tuple[float, float, float, float]:
+        """
+        Predicts apparent celestial coordinates (RA, Dec) at target_mjd using accepted measurements:
+        - 1 detection: centered on previous coordinate with motion prior uncertainty
+        - 2 detections: 2-point linear displacement rate extrapolation
+        - 3+ detections: weighted linear regression extrapolation with covariance propagation
+        Returns (pred_ra, pred_dec, pred_unc_arcsec, search_radius_arcsec).
+        """
+        if len(accepted_pts) == 0:
+            raise ValueError("Cannot predict position with 0 accepted points.")
+
+        # 1 Detection
+        if len(accepted_pts) == 1:
+            p0 = accepted_pts[0]
+            dt_days = abs(target_mjd - float(p0["mjd"]))
+            pred_ra = float(p0["ra"])
+            pred_dec = float(p0["dec"])
+            motion_envelope = prior_rate * dt_days
+            search_radius = base_radius + motion_envelope + (3.0 * float(p0["unc"]))
+            # Positional allowance for motion space without prior velocity vector
+            pred_unc = max(float(p0["unc"]), search_radius / 3.0)
+            return pred_ra, pred_dec, pred_unc, search_radius
+
+        # 2 Detections: 2-point extrapolation
+        if len(accepted_pts) == 2:
+            sorted_pts = sorted(accepted_pts, key=lambda p: float(p["mjd"]))
+            p1, p2 = sorted_pts[0], sorted_pts[1]
+            dt_12 = float(p2["mjd"]) - float(p1["mjd"])
+
+            if abs(dt_12) < 1e-5:
+                pred_ra = (float(p1["ra"]) + float(p2["ra"])) / 2.0
+                pred_dec = (float(p1["dec"]) + float(p2["dec"])) / 2.0
+                pred_unc = max(float(p1["unc"]), float(p2["unc"]))
+                search_radius = max(base_radius, 3.5 * pred_unc)
+                return pred_ra, pred_dec, pred_unc, search_radius
+
+            c1 = SkyCoord(ra=float(p1["ra"]) * u.deg, dec=float(p1["dec"]) * u.deg, frame="icrs")
+            c2 = SkyCoord(ra=float(p2["ra"]) * u.deg, dec=float(p2["dec"]) * u.deg, frame="icrs")
+            dra_u, ddec_u = c1.spherical_offsets_to(c2)
+            dra_arcsec = float(dra_u.to(u.arcsec).value)
+            ddec_arcsec = float(ddec_u.to(u.arcsec).value)
+
+            vx = dra_arcsec / dt_12
+            vy = ddec_arcsec / dt_12
+            sigma_v = math.sqrt(float(p1["unc"])**2 + float(p2["unc"])**2) / abs(dt_12)
+
+            # Extrapolate from p2 if target_mjd >= p2["mjd"], else from p1
+            ref_anchor = p2 if target_mjd >= float(p2["mjd"]) else p1
+            dt_extrap = target_mjd - float(ref_anchor["mjd"])
+            extrap_dra = vx * dt_extrap
+            extrap_ddec = vy * dt_extrap
+
+            cos_dec = math.cos(math.radians(float(ref_anchor["dec"]))) or 1.0
+            d_ra_deg = (extrap_dra / 3600.0) / cos_dec
+            d_dec_deg = extrap_ddec / 3600.0
+            pred_ra = (float(ref_anchor["ra"]) + d_ra_deg) % 360.0
+            pred_dec = max(-90.0, min(90.0, float(ref_anchor["dec"]) + d_dec_deg))
+
+            pred_unc = math.sqrt(float(ref_anchor["unc"])**2 + (sigma_v * abs(dt_extrap))**2 + 0.15**2)
+            search_radius = max(base_radius, 3.5 * pred_unc)
+            return pred_ra, pred_dec, pred_unc, search_radius
+
+        # 3+ Detections: Weighted least-squares linear model
+        sorted_pts = sorted(accepted_pts, key=lambda p: float(p["mjd"]))
+        mjds = np.array([float(p["mjd"]) for p in sorted_pts])
+        uncs = np.array([float(p["unc"]) for p in sorted_pts])
+        eff_uncs = np.sqrt(uncs**2 + 0.15**2)
+        t0 = mjds[0]
+        dt_vec = mjds - t0
+
+        if abs(mjds[-1] - mjds[0]) < 0.01:
+            w = 1.0 / (eff_uncs**2)
+            pred_ra = float(np.sum([float(p["ra"]) for p in sorted_pts] * w) / np.sum(w))
+            pred_dec = float(np.sum([float(p["dec"]) for p in sorted_pts] * w) / np.sum(w))
+            pred_unc = float(1.0 / math.sqrt(np.sum(w)))
+            search_radius = max(base_radius, 3.5 * pred_unc)
+            return pred_ra, pred_dec, pred_unc, search_radius
+
+        c0 = SkyCoord(ra=float(sorted_pts[0]["ra"]) * u.deg, dec=float(sorted_pts[0]["dec"]) * u.deg, frame="icrs")
+        coords = SkyCoord(
+            ra=[float(p["ra"]) for p in sorted_pts] * u.deg,
+            dec=[float(p["dec"]) for p in sorted_pts] * u.deg,
+            frame="icrs"
+        )
+        dra_u, ddec_u = c0.spherical_offsets_to(coords)
+        x_vec = dra_u.to(u.arcsec).value
+        y_vec = ddec_u.to(u.arcsec).value
+
+        poly_x, cov_x = np.polyfit(dt_vec, x_vec, 1, w=1.0/eff_uncs, cov=True)
+        poly_y, cov_y = np.polyfit(dt_vec, y_vec, 1, w=1.0/eff_uncs, cov=True)
+
+        dt_target = target_mjd - t0
+        x_pred = float(poly_x[0] * dt_target + poly_x[1])
+        y_pred = float(poly_y[0] * dt_target + poly_y[1])
+
+        var_x = float(cov_x[0,0] * (dt_target**2) + 2 * cov_x[0,1] * dt_target + cov_x[1,1])
+        var_y = float(cov_y[0,0] * (dt_target**2) + 2 * cov_y[0,1] * dt_target + cov_y[1,1])
+        pred_unc = math.sqrt(max(0.0, var_x) + max(0.0, var_y) + 0.15**2)
+
+        cos_dec = math.cos(math.radians(float(sorted_pts[0]["dec"]))) or 1.0
+        d_ra_deg = (x_pred / 3600.0) / cos_dec
+        d_dec_deg = y_pred / 3600.0
+        pred_ra = (float(sorted_pts[0]["ra"]) + d_ra_deg) % 360.0
+        pred_dec = max(-90.0, min(90.0, float(sorted_pts[0]["dec"]) + d_dec_deg))
+
+        search_radius = max(base_radius, 3.5 * pred_unc)
+        return pred_ra, pred_dec, pred_unc, search_radius
 
     def track_source(self, req: TrackSourceTaskRequest) -> MultiEpochTrack:
         """
@@ -237,8 +373,7 @@ class TrajectoryService:
         elif req.track_id and not req.track_id.startswith("trk_"):
             display_name = req.track_id
         else:
-            track_num = len(self._tracks) + 1
-            display_name = f"Track {track_num:03d}"
+            display_name = self._allocate_display_name()
 
         # Handle absent or invalid celestial WCS in reference epoch
         if not ref_meta.wcs.has_wcs or ref_obs_record["wcs"] is None:
@@ -351,136 +486,161 @@ class TrajectoryService:
             else:
                 cached_sources[o.observation_id] = []
 
-        timeline: List[MatchedEpoch] = []
-        detected_epochs: List[Dict[str, Any]] = []
-
+        timeline_map: Dict[str, MatchedEpoch] = {}
         ref_c = SkyCoord(ra=ref_ra * u.deg, dec=ref_dec * u.deg, frame="icrs")
 
-        for o in unique_epochs:
+        # 1. Initialize reference observation E0
+        ref_idx = next((i for i, o in enumerate(unique_epochs) if o.observation_id == req.reference_observation_id), 0)
+        ref_epoch_meta = unique_epochs[ref_idx]
+
+        ep0 = MatchedEpoch(
+            observation_id=ref_epoch_meta.observation_id,
+            dataset_id=ref_epoch_meta.filename,
+            date_obs=ref_epoch_meta.date_obs,
+            mjd_obs=ref_epoch_meta.mjd_obs,
+            time_delta_days=0.0,
+            pixel_x=ref_source.pixel_x,
+            pixel_y=ref_source.pixel_y,
+            ra_deg=ref_ra,
+            dec_deg=ref_dec,
+            predicted_ra_deg=ref_ra,
+            predicted_dec_deg=ref_dec,
+            prediction_uncertainty_arcsec=ref_unc,
+            separation_arcsec=0.0,
+            separation_sigma=0.0,
+            flux=ref_source.peak_flux,
+            flux_unit=ref_source.flux_unit,
+            snr=ref_source.snr,
+            fwhm_pixels=ref_source.fwhm_pixels,
+            band=getattr(ref_epoch_meta, "band", None) or "LVF",
+            status=MatchStatus.LIKELY_MATCH,
+            matched_source_id=ref_source.id,
+            candidate_count=1,
+            confidence_score=1.0,
+            confidence_rationale="Starting epoch E0 reference detection.",
+            position_uncertainty_arcsec=ref_unc,
+            is_measured=True,
+            photometry_status="measured"
+        )
+        timeline_map[ref_epoch_meta.observation_id] = ep0
+
+        accepted_points: List[Dict[str, Any]] = [{
+            "obs_id": ref_epoch_meta.observation_id,
+            "mjd": ref_epoch_meta.mjd_obs if ref_epoch_meta.mjd_obs is not None else 0.0,
+            "ra": ref_ra,
+            "dec": ref_dec,
+            "unc": ref_unc,
+            "source_id": ref_source.id,
+            "matched_epoch": ep0
+        }]
+
+        def _evaluate_epoch(o: ObservationMetadata):
             obs_id = o.observation_id
             rec = fits_service.get_observation(obs_id)
             if not rec:
-                continue
+                return
 
             dt_days = float(o.mjd_obs - ref_mjd) if (o.mjd_obs is not None and ref_mjd is not None) else 0.0
             band = getattr(o, "band", None) or "LVF"
 
-            # Dynamic search radius = base + (prior_rate * |dt|) + 3 * sigma_pos
-            eff_radius = base_radius + (prior_rate * abs(dt_days)) + (3.0 * ref_unc)
-
-            # 1. Check celestial WCS
+            # Check celestial WCS
             if not o.wcs.has_wcs or rec["wcs"] is None:
-                timeline.append(
-                    MatchedEpoch(
-                        observation_id=obs_id,
-                        dataset_id=o.filename,
-                        date_obs=o.date_obs,
-                        mjd_obs=o.mjd_obs,
-                        time_delta_days=dt_days if o.mjd_obs is not None else None,
-                        band=band,
-                        status=MatchStatus.INSUFFICIENT_DATA,
-                        confidence_score=0.0,
-                        confidence_rationale="Observation lacks valid celestial WCS.",
-                        is_measured=False,
-                        photometry_status="unavailable"
-                    )
-                )
-                continue
-
-            # 2. Check if reference sky position is within detector FOV
-            pix_pos = coordinate_service.sky_to_pixel(rec["wcs"], ref_ra, ref_dec)
-            if pix_pos is None:
-                timeline.append(
-                    MatchedEpoch(
-                        observation_id=obs_id,
-                        dataset_id=o.filename,
-                        date_obs=o.date_obs,
-                        mjd_obs=o.mjd_obs,
-                        time_delta_days=dt_days if o.mjd_obs is not None else None,
-                        band=band,
-                        status=MatchStatus.OUTSIDE_FOV,
-                        confidence_score=0.0,
-                        confidence_rationale="Reference sky position does not project onto image detector plane.",
-                        is_measured=False,
-                        photometry_status="unavailable"
-                    )
-                )
-                continue
-
-            px, py = pix_pos
-            h, w = o.image_shape
-            if px < -5.0 or px >= (w + 5.0) or py < -5.0 or py >= (h + 5.0):
-                timeline.append(
-                    MatchedEpoch(
-                        observation_id=obs_id,
-                        dataset_id=o.filename,
-                        date_obs=o.date_obs,
-                        mjd_obs=o.mjd_obs,
-                        time_delta_days=dt_days if o.mjd_obs is not None else None,
-                        band=band,
-                        status=MatchStatus.OUTSIDE_FOV,
-                        confidence_score=0.0,
-                        confidence_rationale="Target coordinates are outside geometric detector boundaries.",
-                        is_measured=False,
-                        photometry_status="unavailable"
-                    )
-                )
-                continue
-
-            # 3. If starting epoch E0 itself:
-            if obs_id == req.reference_observation_id:
-                ep = MatchedEpoch(
+                timeline_map[obs_id] = MatchedEpoch(
                     observation_id=obs_id,
                     dataset_id=o.filename,
                     date_obs=o.date_obs,
                     mjd_obs=o.mjd_obs,
-                    time_delta_days=0.0,
-                    pixel_x=ref_source.pixel_x,
-                    pixel_y=ref_source.pixel_y,
-                    ra_deg=ref_ra,
-                    dec_deg=ref_dec,
-                    separation_arcsec=0.0,
-                    separation_sigma=0.0,
-                    flux=ref_source.peak_flux,
-                    flux_unit=ref_source.flux_unit,
-                    snr=ref_source.snr,
-                    fwhm_pixels=ref_source.fwhm_pixels,
+                    time_delta_days=dt_days if o.mjd_obs is not None else None,
                     band=band,
-                    status=MatchStatus.LIKELY_MATCH,
-                    matched_source_id=ref_source.id,
-                    candidate_count=1,
-                    confidence_score=1.0,
-                    confidence_rationale="Starting epoch E0 reference detection.",
-                    position_uncertainty_arcsec=ref_unc,
-                    is_measured=True,
-                    photometry_status="measured"
+                    status=MatchStatus.INSUFFICIENT_DATA,
+                    confidence_score=0.0,
+                    confidence_rationale="Observation lacks valid celestial WCS.",
+                    is_measured=False,
+                    photometry_status="unavailable"
                 )
-                timeline.append(ep)
-                detected_epochs.append({
-                    "obs_id": obs_id,
-                    "mjd": o.mjd_obs,
-                    "ra": ref_ra,
-                    "dec": ref_dec,
-                    "unc": ref_unc,
-                    "matched_epoch": ep
-                })
-                continue
+                return
 
-            # 4. Search candidates in target observation
-            candidates = []
+            # Sequential prediction based on accepted points so far
+            target_time = o.mjd_obs if o.mjd_obs is not None else ref_mjd
+            pred_ra, pred_dec, pred_unc, search_radius = self._predict_position_for_epoch(
+                target_mjd=target_time,
+                accepted_pts=accepted_points,
+                prior_rate=prior_rate,
+                base_radius=base_radius
+            )
+
+            # Check if predicted celestial position is within usable detector boundaries
+            pix_pos = coordinate_service.sky_to_pixel(rec["wcs"], pred_ra, pred_dec)
+            if pix_pos is None:
+                timeline_map[obs_id] = MatchedEpoch(
+                    observation_id=obs_id,
+                    dataset_id=o.filename,
+                    date_obs=o.date_obs,
+                    mjd_obs=o.mjd_obs,
+                    time_delta_days=dt_days if o.mjd_obs is not None else None,
+                    band=band,
+                    status=MatchStatus.OUTSIDE_FOV,
+                    confidence_score=0.0,
+                    confidence_rationale="Predicted target position does not project onto image detector plane.",
+                    is_measured=False,
+                    photometry_status="unavailable",
+                    predicted_ra_deg=pred_ra,
+                    predicted_dec_deg=pred_dec,
+                    prediction_uncertainty_arcsec=pred_unc
+                )
+                return
+
+            px, py = pix_pos
+            h, w = o.image_shape
+            if px < -5.0 or px >= (w + 5.0) or py < -5.0 or py >= (h + 5.0):
+                timeline_map[obs_id] = MatchedEpoch(
+                    observation_id=obs_id,
+                    dataset_id=o.filename,
+                    date_obs=o.date_obs,
+                    mjd_obs=o.mjd_obs,
+                    time_delta_days=dt_days if o.mjd_obs is not None else None,
+                    band=band,
+                    status=MatchStatus.OUTSIDE_FOV,
+                    confidence_score=0.0,
+                    confidence_rationale="Predicted target coordinates are outside geometric detector boundaries.",
+                    is_measured=False,
+                    photometry_status="unavailable",
+                    predicted_ra_deg=pred_ra,
+                    predicted_dec_deg=pred_dec,
+                    prediction_uncertainty_arcsec=pred_unc
+                )
+                return
+
+            # Search candidates in target observation around predicted position
+            pred_c = SkyCoord(ra=pred_ra * u.deg, dec=pred_dec * u.deg, frame="icrs")
             target_sources = cached_sources.get(obs_id, [])
+            candidates = []
+
+            # Dynamic model curvature / acceleration allowance for multi-day baselines
+            dt_from_ref = abs(target_time - ref_mjd)
+            accel_allowance = 0.5 * dt_from_ref if len(accepted_points) >= 2 else 0.0
 
             for s in target_sources:
                 if s.ra_deg is not None and s.dec_deg is not None:
                     s_c = SkyCoord(ra=s.ra_deg * u.deg, dec=s.dec_deg * u.deg, frame="icrs")
-                    sep_arcsec = float(ref_c.separation(s_c).arcsec)
-                    if sep_arcsec <= eff_radius:
-                        candidates.append((sep_arcsec, s))
+                    sep_pred = float(pred_c.separation(s_c).arcsec)
+                    tgt_unc = float(s.position_uncertainty_arcsec or 0.3)
+                    comb_unc = math.sqrt(pred_unc**2 + tgt_unc**2 + accel_allowance**2)
+                    sep_sigma = sep_pred / comb_unc if comb_unc > 0 else 1.0
+                    sep_ref = float(ref_c.separation(s_c).arcsec)
+                    if sep_pred <= search_radius:
+                        candidates.append({
+                            "source": s,
+                            "sep_pred": sep_pred,
+                            "sep_sigma": sep_sigma,
+                            "comb_unc": comb_unc,
+                            "sep_ref": sep_ref,
+                            "tgt_unc": tgt_unc
+                        })
 
-            candidates.sort(key=lambda c: c[0])
+            candidates.sort(key=lambda c: c["sep_pred"])
 
             if len(candidates) == 0:
-                # Forced aperture photometry at predicted position
                 phot = perform_forced_aperture_photometry(
                     data=rec["data"],
                     px=px,
@@ -488,139 +648,203 @@ class TrajectoryService:
                     flags=rec.get("flags"),
                     variance=rec.get("variance")
                 )
-
-                timeline.append(
-                    MatchedEpoch(
-                        observation_id=obs_id,
-                        dataset_id=o.filename,
-                        date_obs=o.date_obs,
-                        mjd_obs=o.mjd_obs,
-                        time_delta_days=dt_days if o.mjd_obs is not None else None,
-                        band=band,
-                        status=MatchStatus.NOT_DETECTED,
-                        candidate_count=0,
-                        confidence_score=0.0,
-                        confidence_rationale=(
-                            f"Field observed, but no source detected above threshold within {eff_radius:.1f}\" "
-                            f"(prior: {prior_key}). Forced aperture photometry status: {phot['status']}."
-                        ),
-                        is_measured=False,
-                        photometry_status=phot["status"],
-                        flux=phot.get("flux"),
-                        flux_uncertainty=phot.get("uncertainty"),
-                        upper_limit_3sigma=phot.get("upper_limit_3sigma")
-                    )
-                )
-            elif len(candidates) == 1:
-                sep_arcsec, best_src = candidates[0]
-                tgt_unc = float(best_src.position_uncertainty_arcsec or 0.3)
-                comb_unc = math.sqrt(ref_unc**2 + tgt_unc**2)
-                sep_sigma = sep_arcsec / comb_unc if comb_unc > 0 else 1.0
-
-                spatial_factor = math.exp(-0.5 * min(10.0, sep_sigma**2))
-                snr_factor = min(1.0, max(0.2, (best_src.snr or 5.0) / 10.0))
-                score = round(float(0.7 * spatial_factor + 0.3 * snr_factor), 3)
-
-                ep = MatchedEpoch(
+                timeline_map[obs_id] = MatchedEpoch(
                     observation_id=obs_id,
                     dataset_id=o.filename,
                     date_obs=o.date_obs,
                     mjd_obs=o.mjd_obs,
                     time_delta_days=dt_days if o.mjd_obs is not None else None,
-                    pixel_x=best_src.pixel_x,
-                    pixel_y=best_src.pixel_y,
-                    ra_deg=best_src.ra_deg,
-                    dec_deg=best_src.dec_deg,
-                    separation_arcsec=round(sep_arcsec, 3),
-                    separation_sigma=round(sep_sigma, 2),
-                    flux=best_src.peak_flux,
-                    flux_unit=best_src.flux_unit,
-                    snr=best_src.snr,
-                    fwhm_pixels=best_src.fwhm_pixels,
                     band=band,
-                    status=MatchStatus.LIKELY_MATCH,
-                    matched_source_id=best_src.id,
-                    candidate_count=1,
-                    confidence_score=score,
+                    status=MatchStatus.NOT_DETECTED,
+                    candidate_count=0,
+                    confidence_score=0.0,
                     confidence_rationale=(
-                        f"Unambiguous detection at {sep_arcsec:.2f}\" separation ({sep_sigma:.1f}σ). "
-                        f"SNR: {best_src.snr:.1f}σ in {band}."
+                        f"Field observed, but no source detected above threshold within {search_radius:.1f}\" of predicted position "
+                        f"(prior: {prior_key}). Forced aperture photometry status: {phot['status']}."
                     ),
-                    position_uncertainty_arcsec=tgt_unc,
-                    is_measured=True,
-                    photometry_status="measured"
+                    is_measured=False,
+                    photometry_status=phot["status"],
+                    flux=phot.get("flux"),
+                    flux_uncertainty=phot.get("uncertainty"),
+                    upper_limit_3sigma=phot.get("upper_limit_3sigma"),
+                    predicted_ra_deg=pred_ra,
+                    predicted_dec_deg=pred_dec,
+                    prediction_uncertainty_arcsec=pred_unc
                 )
-                timeline.append(ep)
-                detected_epochs.append({
-                    "obs_id": obs_id,
-                    "mjd": o.mjd_obs,
-                    "ra": best_src.ra_deg,
-                    "dec": best_src.dec_deg,
-                    "unc": tgt_unc,
-                    "matched_epoch": ep
-                })
-            else:
-                # Multiple candidates -> Ambiguous association
-                sep_arcsec, best_src = candidates[0]
-                tgt_unc = float(best_src.position_uncertainty_arcsec or 0.3)
-                comb_unc = math.sqrt(ref_unc**2 + tgt_unc**2)
-                sep_sigma = sep_arcsec / comb_unc if comb_unc > 0 else 1.0
+                return
 
-                score = round(float(0.4 * math.exp(-0.5 * min(10.0, sep_sigma**2))), 3)
+            # Evaluate candidates for kinematical consistency
+            valid_candidates = [
+                c for c in candidates
+                if c["sep_sigma"] <= 3.5 or c["sep_pred"] <= max(1.5, 3.0 * c["comb_unc"])
+            ]
 
+            if len(valid_candidates) == 0:
+                phot = perform_forced_aperture_photometry(
+                    data=rec["data"],
+                    px=px,
+                    py=py,
+                    flags=rec.get("flags"),
+                    variance=rec.get("variance")
+                )
+                timeline_map[obs_id] = MatchedEpoch(
+                    observation_id=obs_id,
+                    dataset_id=o.filename,
+                    date_obs=o.date_obs,
+                    mjd_obs=o.mjd_obs,
+                    time_delta_days=dt_days if o.mjd_obs is not None else None,
+                    band=band,
+                    status=MatchStatus.NOT_DETECTED,
+                    candidate_count=len(candidates),
+                    confidence_score=0.0,
+                    confidence_rationale=(
+                        f"Field observed, but nearest source at {candidates[0]['sep_pred']:.1f}\" deviates by "
+                        f"{candidates[0]['sep_sigma']:.1f}σ from predicted trajectory. Classified as non-detection."
+                    ),
+                    is_measured=False,
+                    photometry_status=phot["status"],
+                    flux=phot.get("flux"),
+                    flux_uncertainty=phot.get("uncertainty"),
+                    upper_limit_3sigma=phot.get("upper_limit_3sigma"),
+                    predicted_ra_deg=pred_ra,
+                    predicted_dec_deg=pred_dec,
+                    prediction_uncertainty_arcsec=pred_unc
+                )
+                return
+
+            # Check for ambiguity among candidates
+            is_ambiguous = (
+                len(valid_candidates) >= 2 or
+                (len(candidates) >= 2 and abs(candidates[1]["sep_pred"] - candidates[0]["sep_pred"]) < 2.0 * candidates[0]["comb_unc"])
+            )
+
+            if is_ambiguous:
+                best_c = candidates[0]
                 competing = [
                     {
-                        "source_id": s.id,
-                        "pixel_x": s.pixel_x,
-                        "pixel_y": s.pixel_y,
-                        "ra_deg": s.ra_deg,
-                        "dec_deg": s.dec_deg,
-                        "separation_arcsec": round(c_sep, 3),
-                        "snr": s.snr,
-                        "flux": s.peak_flux
+                        "source_id": c["source"].id,
+                        "pixel_x": c["source"].pixel_x,
+                        "pixel_y": c["source"].pixel_y,
+                        "ra_deg": c["source"].ra_deg,
+                        "dec_deg": c["source"].dec_deg,
+                        "separation_arcsec": round(c["sep_pred"], 3),
+                        "separation_ref_arcsec": round(c["sep_ref"], 3),
+                        "separation_sigma": round(c["sep_sigma"], 2),
+                        "snr": c["source"].snr,
+                        "flux": c["source"].peak_flux
                     }
-                    for c_sep, s in candidates
+                    for c in candidates
                 ]
+                score = round(float(0.4 * math.exp(-0.5 * min(9.0, best_c["sep_sigma"]**2))), 3)
 
-                ep = MatchedEpoch(
+                timeline_map[obs_id] = MatchedEpoch(
                     observation_id=obs_id,
                     dataset_id=o.filename,
                     date_obs=o.date_obs,
                     mjd_obs=o.mjd_obs,
                     time_delta_days=dt_days if o.mjd_obs is not None else None,
-                    pixel_x=best_src.pixel_x,
-                    pixel_y=best_src.pixel_y,
-                    ra_deg=best_src.ra_deg,
-                    dec_deg=best_src.dec_deg,
-                    separation_arcsec=round(sep_arcsec, 3),
-                    separation_sigma=round(sep_sigma, 2),
-                    flux=best_src.peak_flux,
-                    flux_unit=best_src.flux_unit,
-                    snr=best_src.snr,
-                    fwhm_pixels=best_src.fwhm_pixels,
+                    pixel_x=best_c["source"].pixel_x,
+                    pixel_y=best_c["source"].pixel_y,
+                    ra_deg=best_c["source"].ra_deg,
+                    dec_deg=best_c["source"].dec_deg,
+                    separation_arcsec=round(best_c["sep_ref"], 3),
+                    separation_sigma=round(best_c["sep_sigma"], 2),
+                    flux=best_c["source"].peak_flux,
+                    flux_unit=best_c["source"].flux_unit,
+                    snr=best_c["source"].snr,
+                    fwhm_pixels=best_c["source"].fwhm_pixels,
                     band=band,
                     status=MatchStatus.AMBIGUOUS_MATCH,
-                    matched_source_id=best_src.id,
+                    matched_source_id=None,
                     candidate_count=len(candidates),
                     competing_candidates=competing,
                     confidence_score=score,
                     confidence_rationale=(
-                        f"Ambiguous: {len(candidates)} candidates within search radius ({eff_radius:.1f}\"). "
-                        f"Closest candidate is {sep_arcsec:.2f}\" away. Source blending or crowded field."
+                        f"Ambiguous: {len(candidates)} candidates within search radius ({search_radius:.1f}\"). "
+                        f"Closest is {best_c['sep_pred']:.2f}\" ({best_c['sep_sigma']:.1f}σ) from predicted position. Requires review."
                     ),
-                    position_uncertainty_arcsec=tgt_unc,
-                    is_measured=True,
-                    photometry_status="measured"
+                    position_uncertainty_arcsec=best_c["tgt_unc"],
+                    is_measured=False,
+                    photometry_status="measured",
+                    predicted_ra_deg=pred_ra,
+                    predicted_dec_deg=pred_dec,
+                    prediction_uncertainty_arcsec=pred_unc
                 )
-                timeline.append(ep)
-                detected_epochs.append({
-                    "obs_id": obs_id,
-                    "mjd": o.mjd_obs,
-                    "ra": best_src.ra_deg,
-                    "dec": best_src.dec_deg,
-                    "unc": tgt_unc,
-                    "matched_epoch": ep
-                })
+                return
+
+            # Single unambiguous candidate
+            best_c = valid_candidates[0]
+            spatial_factor = math.exp(-0.5 * min(9.0, best_c["sep_sigma"]**2))
+            snr_factor = min(1.0, max(0.2, (best_c["source"].snr or 5.0) / 10.0))
+            score = round(float(0.7 * spatial_factor + 0.3 * snr_factor), 3)
+
+            ep = MatchedEpoch(
+                observation_id=obs_id,
+                dataset_id=o.filename,
+                date_obs=o.date_obs,
+                mjd_obs=o.mjd_obs,
+                time_delta_days=dt_days if o.mjd_obs is not None else None,
+                pixel_x=best_c["source"].pixel_x,
+                pixel_y=best_c["source"].pixel_y,
+                ra_deg=best_c["source"].ra_deg,
+                dec_deg=best_c["source"].dec_deg,
+                separation_arcsec=round(best_c["sep_ref"], 3),
+                separation_sigma=round(best_c["sep_sigma"], 2),
+                flux=best_c["source"].peak_flux,
+                flux_unit=best_c["source"].flux_unit,
+                snr=best_c["source"].snr,
+                fwhm_pixels=best_c["source"].fwhm_pixels,
+                band=band,
+                status=MatchStatus.LIKELY_MATCH,
+                matched_source_id=best_c["source"].id,
+                candidate_count=1,
+                confidence_score=score,
+                confidence_rationale=(
+                    f"Unambiguous detection at {best_c['sep_pred']:.2f}\" from prediction ({best_c['sep_sigma']:.1f}σ). "
+                    f"SNR: {best_c['source'].snr:.1f}σ in {band}."
+                ),
+                position_uncertainty_arcsec=best_c["tgt_unc"],
+                is_measured=True,
+                photometry_status="measured",
+                predicted_ra_deg=pred_ra,
+                predicted_dec_deg=pred_dec,
+                prediction_uncertainty_arcsec=pred_unc
+            )
+            timeline_map[obs_id] = ep
+            accepted_points.append({
+                "obs_id": obs_id,
+                "mjd": o.mjd_obs if o.mjd_obs is not None else ref_mjd,
+                "ra": best_c["source"].ra_deg,
+                "dec": best_c["source"].dec_deg,
+                "unc": best_c["tgt_unc"],
+                "source_id": best_c["source"].id,
+                "matched_epoch": ep
+            })
+
+        # Process forward in time from reference epoch
+        for o in unique_epochs[ref_idx + 1:]:
+            _evaluate_epoch(o)
+
+        # Process backward in time from reference epoch
+        for o in reversed(unique_epochs[:ref_idx]):
+            _evaluate_epoch(o)
+
+        # Re-assemble complete timeline in chronological order
+        timeline = [timeline_map[o.observation_id] for o in unique_epochs if o.observation_id in timeline_map]
+
+        # Extract only confirmed, measured detections for trajectory fitting
+        detected_epochs = [
+            {
+                "obs_id": ep.observation_id,
+                "mjd": ep.mjd_obs,
+                "ra": ep.ra_deg,
+                "dec": ep.dec_deg,
+                "unc": ep.position_uncertainty_arcsec,
+                "matched_epoch": ep
+            }
+            for ep in timeline if ep.is_measured and ep.status == MatchStatus.LIKELY_MATCH and ep.ra_deg is not None
+        ]
+        detected_epochs.sort(key=lambda x: x["mjd"] if x["mjd"] is not None else 0.0)
 
         fit_info, quality_status, quality_rationale = self._evaluate_trajectory_quality(
             detected_epochs=detected_epochs,
@@ -738,8 +962,12 @@ class TrajectoryService:
         target_ep.is_measured = True
         target_ep.confidence_rationale = f"User-confirmed candidate match: {candidate_source_id}."
 
-        # Re-evaluate trajectory
         ref_c = SkyCoord(ra=track.reference_ra_deg * u.deg, dec=track.reference_dec_deg * u.deg, frame="icrs")
+        if chosen["ra_deg"] is not None and chosen["dec_deg"] is not None:
+            cand_c = SkyCoord(ra=chosen["ra_deg"] * u.deg, dec=chosen["dec_deg"] * u.deg, frame="icrs")
+            target_ep.separation_arcsec = round(float(ref_c.separation(cand_c).arcsec), 3)
+
+        # Re-evaluate trajectory with accepted measurements only
         detected_epochs = [
             {
                 "obs_id": ep.observation_id,
@@ -749,8 +977,9 @@ class TrajectoryService:
                 "unc": ep.position_uncertainty_arcsec,
                 "matched_epoch": ep
             }
-            for ep in track.timeline if ep.is_measured and ep.ra_deg is not None
+            for ep in track.timeline if ep.is_measured and ep.status == MatchStatus.LIKELY_MATCH and ep.ra_deg is not None
         ]
+        detected_epochs.sort(key=lambda x: x["mjd"] if x["mjd"] is not None else 0.0)
 
         fit_info, q_status, q_rationale = self._evaluate_trajectory_quality(
             detected_epochs=detected_epochs,
@@ -822,7 +1051,21 @@ class TrajectoryService:
         """
         n_det = len(detected_epochs)
 
-        # 1. Fewer than 2 detections
+        # 1. Check for ambiguous candidates across timeline FIRST
+        has_ambiguity = any(ep.status == MatchStatus.AMBIGUOUS_MATCH for ep in timeline)
+        if has_ambiguity:
+            fit_info = TrajectoryFitInfo(
+                fit_model=FitModelType.SINGLE_POINT if n_det <= 1 else (FitModelType.DISPLACEMENT_ONLY if n_det == 2 else FitModelType.LINEAR_MOTION),
+                is_verified_motion=False,
+                fit_assessment="Ambiguous candidate detections present in at least one observation epoch requiring user review."
+            )
+            return (
+                fit_info,
+                TrajectoryQualityStatus.AMBIGUOUS,
+                "Ambiguous association: Multiple candidates detected in at least one epoch."
+            )
+
+        # 2. Fewer than 2 detections
         if n_det < 2:
             fit_info = TrajectoryFitInfo(
                 fit_model=FitModelType.SINGLE_POINT if n_det == 1 else FitModelType.NONE,
@@ -834,9 +1077,6 @@ class TrajectoryService:
                 TrajectoryQualityStatus.INSUFFICIENT_DATA,
                 f"Insufficient data: Only {n_det} detection in {total_eligible} eligible epochs. At least 2 epochs are required to evaluate association."
             )
-
-        # 2. Check for ambiguous candidates across timeline
-        has_ambiguity = any(ep.status == MatchStatus.AMBIGUOUS_MATCH for ep in timeline)
 
         # 3. Exactly 2 detections (Displacement only, strictly unverified motion)
         if n_det == 2:

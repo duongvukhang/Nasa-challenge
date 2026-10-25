@@ -184,13 +184,24 @@ export const SkyViewer = ({
       const isConfirmed = currentEp.status === "Likely match";
       const isAmbiguous = currentEp.status === "Ambiguous match";
 
-      map.set(currentEp.matched_source_id, {
-        track: tr,
-        persistentLabel,
-        isConfirmed,
-        isAmbiguous,
-        epoch: currentEp
-      });
+      if (map.has(currentEp.matched_source_id)) {
+        const existing = map.get(currentEp.matched_source_id);
+        existing.hasConflict = true;
+        existing.conflictingTracks = existing.conflictingTracks || [existing.track];
+        existing.conflictingTracks.push(tr);
+        existing.persistentLabel = `${existing.persistentLabel} / ${persistentLabel} [CONFLICT]`;
+        existing.isConfirmed = false;
+        existing.isAmbiguous = true;
+      } else {
+        map.set(currentEp.matched_source_id, {
+          track: tr,
+          persistentLabel,
+          isConfirmed,
+          isAmbiguous,
+          hasConflict: false,
+          epoch: currentEp
+        });
+      }
     }
     return map;
   }, [visibleTrackList, observation?.observation_id]);
@@ -398,9 +409,9 @@ export const SkyViewer = ({
             const trackColor = tr.color || getStableTrackColor(tr.track_id);
             const isActive = tr.track_id === activeTrackId;
 
-            // Extract measured waypoints reprojected into current field
+            // Extract measured waypoints reprojected into current field (strictly confirmed matches)
             const waypoints = (tr.timeline || [])
-              .filter((ep) => ep.is_measured)
+              .filter((ep) => ep.is_measured && ep.status === "Likely match")
               .map((ep, idx) => {
                 const coords = getEpochScreenCoords(ep);
                 if (!coords) return null;
@@ -567,6 +578,62 @@ export const SkyViewer = ({
             );
           })}
 
+          {/* Ambiguous / Candidate Review Reticles in Current Epoch */}
+          {visibleTrackList.map((tr) => {
+            const currentEp = tr.timeline?.find((ep) => ep.observation_id === observation?.observation_id);
+            if (!currentEp || currentEp.status !== "Ambiguous match") return null;
+
+            const coords = getEpochScreenCoords({
+              ra_deg: currentEp.predicted_ra_deg || currentEp.ra_deg,
+              dec_deg: currentEp.predicted_dec_deg || currentEp.dec_deg,
+              pixel_x: currentEp.pixel_x,
+              pixel_y: currentEp.pixel_y
+            });
+            if (!coords) return null;
+
+            return (
+              <g
+                key={`ambiguous_review_${tr.track_id}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onSelectTrack?.(tr.track_id);
+                }}
+                className="cursor-pointer pointer-events-auto"
+              >
+                <circle
+                  cx={coords.x}
+                  cy={coords.y}
+                  r={15}
+                  fill="none"
+                  stroke="#f59e0b"
+                  strokeWidth={1.5}
+                  strokeDasharray="4,3"
+                  vectorEffect="non-scaling-stroke"
+                />
+                <circle
+                  cx={coords.x}
+                  cy={coords.y}
+                  r={3}
+                  fill="#f59e0b"
+                  stroke="#ffffff"
+                  strokeWidth={0.8}
+                  vectorEffect="non-scaling-stroke"
+                />
+                <text
+                  x={coords.x + 16}
+                  y={coords.y - 4}
+                  fill="#f59e0b"
+                  fontSize={10}
+                  fontFamily="monospace"
+                  fontWeight="bold"
+                  className="pointer-events-none select-none drop-shadow"
+                >
+                  {tr.display_name || tr.track_id} [REVIEW ({currentEp.candidate_count || 2} Cands)]
+                </text>
+              </g>
+            );
+          })}
+
           {/* 3. Prediction Vector & Trajectory (When available) */}
           {predictionData?.trajectory_points?.length > 1 && (
             <g className="pointer-events-none">
@@ -627,12 +694,17 @@ export const SkyViewer = ({
 
               // Check persistent track association in active observation
               const association = sourceTrackMap.get(src.id);
-              const isTrackedConfirmed = association && association.isConfirmed;
+              const isTrackedConfirmed = association && association.isConfirmed && !association.hasConflict;
+              const hasConflict = association && association.hasConflict;
               const trackColor = association?.track?.color || (association?.track ? getStableTrackColor(association.track.track_id) : null);
               const isTrackActive = association?.track?.track_id === activeTrackId;
 
-              // Persistent track identity for confirmed associations; detection ID for unassociated/ambiguous sources
-              const displayLabel = isTrackedConfirmed ? association.persistentLabel : src.id;
+              // Persistent track identity for confirmed associations; detection ID for unassociated/ambiguous/conflicting sources
+              const displayLabel = isTrackedConfirmed
+                ? association.persistentLabel
+                : hasConflict
+                ? `${src.id} [CONFLICT]`
+                : src.id;
 
               return (
                 <g
@@ -646,27 +718,46 @@ export const SkyViewer = ({
                   }}
                   className="cursor-pointer pointer-events-auto"
                 >
-                  {/* Thin green square — no fill for unselected, faint fill for selected */}
+                  {/* Square marker — green for normal, amber dashed for conflict */}
                   <rect
                     x={screenX - half}
                     y={screenY - half}
                     width={size}
                     height={size}
-                    fill={isSelected ? "rgba(34, 197, 94, 0.15)" : "none"}
-                    stroke={isSelected ? "#4ade80" : "#22c55e"}
-                    strokeWidth={isSelected ? 1.5 : 1}
+                    fill={
+                      hasConflict
+                        ? "rgba(245, 158, 11, 0.2)"
+                        : isSelected
+                        ? "rgba(34, 197, 94, 0.15)"
+                        : "none"
+                    }
+                    stroke={
+                      hasConflict
+                        ? "#f59e0b"
+                        : isSelected
+                        ? "#4ade80"
+                        : "#22c55e"
+                    }
+                    strokeWidth={isSelected || hasConflict ? 1.5 : 1}
+                    strokeDasharray={hasConflict ? "3,2" : undefined}
                     vectorEffect="non-scaling-stroke"
                   />
 
-                  {/* Source Label (When enabled, selected, or confirmed track) */}
-                  {(overlaySettings.showLabels || isSelected || isTrackedConfirmed) && (
+                  {/* Source Label (When enabled, selected, confirmed track, or conflict) */}
+                  {(overlaySettings.showLabels || isSelected || isTrackedConfirmed || hasConflict) && (
                     <text
                       x={screenX + half + 3}
                       y={screenY - half + 2}
-                      fill={isTrackedConfirmed ? (trackColor || "#38bdf8") : "#e2e8f0"}
+                      fill={
+                        hasConflict
+                          ? "#f59e0b"
+                          : isTrackedConfirmed
+                          ? (trackColor || "#38bdf8")
+                          : "#e2e8f0"
+                      }
                       fontSize={isSelected || isTrackActive ? 11 : 10}
                       fontFamily="monospace"
-                      fontWeight={isTrackedConfirmed || isSelected ? "bold" : "normal"}
+                      fontWeight={isTrackedConfirmed || isSelected || hasConflict ? "bold" : "normal"}
                       className="pointer-events-none select-none drop-shadow"
                     >
                       {displayLabel}

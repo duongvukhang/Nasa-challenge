@@ -312,20 +312,38 @@ export const App = () => {
         pixelX: src.pixel_x,
         pixelY: src.pixel_y
       };
-      // Explicit user action required to track across epochs (via 'Track Across Epochs' button)
+
+      // Check if this source belongs to an existing active track in the current observation
+      const trackList = Object.values(tracks);
+      const associatedTrack = trackList.find((tr) => {
+        const ep = tr?.timeline?.find((e) => e.observation_id === activeObservationId);
+        return ep?.is_measured && ep?.matched_source_id === src.id && ep?.status === "Likely match";
+      });
+
+      if (associatedTrack) {
+        setActiveTrackId(associatedTrack.track_id);
+        setTrackData(associatedTrack);
+      } else {
+        // If clicking an unassociated source, clear active track context to avoid stale display
+        setActiveTrackId(null);
+        setTrackData(null);
+      }
     },
-    [activeObservationId]
+    [activeObservationId, tracks]
   );
 
   // Determine the active track associated with the selected source in the current observation
   const selectedSourceTrack = useMemo(() => {
-    if (!selectedSource || !activeObservationId) return null;
-    const trackList = Object.values(tracks);
-    for (const tr of trackList) {
-      const epMatch = tr?.timeline?.find((ep) => ep.observation_id === activeObservationId);
-      if (epMatch?.is_measured && epMatch.matched_source_id === selectedSource.id && epMatch.status === "Likely match") {
-        return tr;
+    if (!activeObservationId) return null;
+    if (selectedSource) {
+      const trackList = Object.values(tracks);
+      for (const tr of trackList) {
+        const epMatch = tr?.timeline?.find((ep) => ep.observation_id === activeObservationId);
+        if (epMatch?.is_measured && epMatch.matched_source_id === selectedSource.id && epMatch.status === "Likely match") {
+          return tr;
+        }
       }
+      return null;
     }
     return activeTrackId && tracks[activeTrackId] ? tracks[activeTrackId] : trackData;
   }, [selectedSource, activeObservationId, tracks, activeTrackId, trackData]);
@@ -468,10 +486,16 @@ export const App = () => {
     if (epMatch?.is_measured && epMatch.status === "Likely match" && epMatch.matched_source_id) {
       const found = sources.find((s) => s.id === epMatch.matched_source_id);
       if (found && selectedSource?.id !== found.id) {
-        setSelectedSource(found);
+        // Only auto-synchronize if no source is currently selected or current selected source is already part of this track
+        const isCurrentSourcePartOfTrack = selectedSource && currentTrack.timeline?.some(
+          (ep) => ep.matched_source_id === selectedSource.id
+        );
+        if (!selectedSource || isCurrentSourcePartOfTrack) {
+          setSelectedSource(found);
+        }
       }
     }
-  }, [tracks, activeTrackId, trackData, activeObservationId, sources, selectedSource?.id]);
+  }, [tracks, activeTrackId, trackData, activeObservationId, sources, selectedSource]);
 
   // Action handlers
   const handleUploadFits = async (file) => {

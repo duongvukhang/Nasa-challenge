@@ -12,6 +12,7 @@ from app.services.source_detection import source_detection_service
 from app.schemas.tracking import (
     TrackSourceTaskRequest,
     MatchStatus,
+    TrajectoryQualityStatus,
     AcceptCandidateRequest
 )
 from backend.tests.test_trajectory_service import create_custom_test_fits
@@ -364,3 +365,202 @@ def test_clear_all_tracks_endpoint(tmp_path):
     assert resp.status_code == 200
     assert resp.json()["status"] == "success"
     assert len(trajectory_service.list_tracks()) == 0
+
+@pytest.mark.synthetic
+def test_collision_safe_track_display_name_allocation(tmp_path):
+    """
+    Requirement 2 & 4:
+    Track display name allocation is monotonic and collision-safe.
+    Deleting an earlier track does NOT cause duplicate name reuse of an existing track.
+    """
+    p1 = tmp_path / "coll_obs1.fits"
+    create_custom_test_fits(
+        p1,
+        ra_center=120.0,
+        dec_center=15.0,
+        date_obs_iso="2025-05-01T00:00:00",
+        sources=[
+            {"x": 30.0, "y": 30.0, "peak": 80.0},
+            {"x": 60.0, "y": 60.0, "peak": 80.0},
+            {"x": 90.0, "y": 90.0, "peak": 80.0}
+        ],
+        obs_id="coll_obs1"
+    )
+    fits_service.parse_fits_file(p1, observation_id="coll_obs1")
+    obs1 = fits_service.get_observation("coll_obs1")
+    srcs = source_detection_service.detect_sources("coll_obs1", obs1["data"], obs1["wcs"], bunit="MJy/sr").sources
+    assert len(srcs) >= 3
+
+    # Create Track 001
+    t1 = trajectory_service.track_source(TrackSourceTaskRequest(
+        reference_observation_id="coll_obs1",
+        reference_source_id=srcs[0].id
+    ))
+    assert t1.display_name == "Track 001"
+
+    # Create Track 002
+    t2 = trajectory_service.track_source(TrackSourceTaskRequest(
+        reference_observation_id="coll_obs1",
+        reference_source_id=srcs[1].id
+    ))
+    assert t2.display_name == "Track 002"
+
+    # Delete Track 001
+    trajectory_service.delete_track(t1.track_id)
+    assert trajectory_service.get_track(t1.track_id) is None
+    assert trajectory_service.get_track(t2.track_id) is not None
+
+    # Create third track: must be Track 003, NEVER colliding with existing Track 002!
+    t3 = trajectory_service.track_source(TrackSourceTaskRequest(
+        reference_observation_id="coll_obs1",
+        reference_source_id=srcs[2].id
+    ))
+    assert t3.display_name == "Track 003"
+    assert t3.display_name != t2.display_name
+
+@pytest.mark.synthetic
+def test_sequential_predictive_association_avoids_reference_coord_background_star(tmp_path):
+    """
+    Requirement 4:
+    Sequential predictive association tracks moving objects along their trajectory
+    and does NOT falsely match a stationary background star at the original reference coordinate.
+    """
+    p1 = tmp_path / "seq_ep1.fits"
+    p2 = tmp_path / "seq_ep2.fits"
+    p3 = tmp_path / "seq_ep3.fits"
+
+    # Moving object moves by +4 pixels in X per day (~25 arcsec/day)
+    # At Epoch 3, a stationary background star is present at the original reference coordinate (50, 50)
+    create_custom_test_fits(p1, ra_center=120.0, dec_center=15.0, date_obs_iso="2025-05-01T00:00:00",
+                            sources=[{"x": 50.0, "y": 50.0, "peak": 80.0}], obs_id="seq_ep1")
+    create_custom_test_fits(p2, ra_center=120.0, dec_center=15.0, date_obs_iso="2025-05-02T00:00:00",
+                            sources=[{"x": 54.0, "y": 50.0, "peak": 80.0}], obs_id="seq_ep2")
+    create_custom_test_fits(p3, ra_center=120.0, dec_center=15.0, date_obs_iso="2025-05-03T00:00:00",
+                            sources=[
+                                {"x": 58.0, "y": 50.0, "peak": 80.0},  # Moving target
+                                {"x": 50.0, "y": 50.0, "peak": 80.0}   # Stationary star at E0 reference coordinate
+                            ], obs_id="seq_ep3")
+
+    fits_service.parse_fits_file(p1, observation_id="seq_ep1")
+    fits_service.parse_fits_file(p2, observation_id="seq_ep2")
+    fits_service.parse_fits_file(p3, observation_id="seq_ep3")
+
+    obs1 = fits_service.get_observation("seq_ep1")
+    obs3 = fits_service.get_observation("seq_ep3")
+
+    srcs1 = source_detection_service.detect_sources("seq_ep1", obs1["data"], obs1["wcs"], bunit="MJy/sr").sources
+    srcs3 = source_detection_service.detect_sources("seq_ep3", obs3["data"], obs3["wcs"], bunit="MJy/sr").sources
+
+    moving_src_ep3 = min(srcs3, key=lambda s: (s.pixel_x - 58.0)**2 + (s.pixel_y - 50.0)**2)
+    bg_star_ep3 = min(srcs3, key=lambda s: (s.pixel_x - 50.0)**2 + (s.pixel_y - 50.0)**2)
+
+    # Track moving source starting at ep1
+    track = trajectory_service.track_source(TrackSourceTaskRequest(
+        reference_observation_id="seq_ep1",
+        reference_source_id=srcs1[0].id,
+        matching_radius_arcsec=30.0
+    ))
+
+    assert track.detected_epochs_count == 3
+    ep3_match = next(ep for ep in track.timeline if ep.observation_id == "seq_ep3")
+
+    # The moving object at (58, 50) is matched, NOT the stationary star at (50, 50)
+    assert ep3_match.status == MatchStatus.LIKELY_MATCH
+    assert ep3_match.matched_source_id == moving_src_ep3.id
+    assert ep3_match.matched_source_id != bg_star_ep3.id
+    assert abs(ep3_match.pixel_x - 58.0) < 1.0
+
+@pytest.mark.synthetic
+def test_disappearing_moving_object_records_not_detected_instead_of_unrelated_star(tmp_path):
+    """
+    Requirement 4:
+    If a moving target disappears in a subsequent epoch, it must NOT falsely match an
+    unrelated background star elsewhere in the image.
+    """
+    p1 = tmp_path / "dis_ep1.fits"
+    p2 = tmp_path / "dis_ep2.fits"
+    p3 = tmp_path / "dis_ep3.fits"
+
+    # Moving object at (50, 50) in Ep1, (55, 50) in Ep2 (~31 arcsec/day)
+    # In Ep3, moving object disappeared, but an unrelated star exists at (20, 20)
+    create_custom_test_fits(p1, ra_center=120.0, dec_center=15.0, date_obs_iso="2025-05-01T00:00:00",
+                            sources=[{"x": 50.0, "y": 50.0, "peak": 80.0}], obs_id="dis_ep1")
+    create_custom_test_fits(p2, ra_center=120.0, dec_center=15.0, date_obs_iso="2025-05-02T00:00:00",
+                            sources=[{"x": 55.0, "y": 50.0, "peak": 80.0}], obs_id="dis_ep2")
+    create_custom_test_fits(p3, ra_center=120.0, dec_center=15.0, date_obs_iso="2025-05-03T00:00:00",
+                            sources=[{"x": 20.0, "y": 20.0, "peak": 80.0}], obs_id="dis_ep3")
+
+    fits_service.parse_fits_file(p1, observation_id="dis_ep1")
+    fits_service.parse_fits_file(p2, observation_id="dis_ep2")
+    fits_service.parse_fits_file(p3, observation_id="dis_ep3")
+
+    obs1 = fits_service.get_observation("dis_ep1")
+    srcs1 = source_detection_service.detect_sources("dis_ep1", obs1["data"], obs1["wcs"], bunit="MJy/sr").sources
+
+    track = trajectory_service.track_source(TrackSourceTaskRequest(
+        reference_observation_id="dis_ep1",
+        reference_source_id=srcs1[0].id,
+        matching_radius_arcsec=35.0
+    ))
+
+    assert track.detected_epochs_count == 2
+    assert track.missed_epochs_count == 1
+
+    ep3 = next(ep for ep in track.timeline if ep.observation_id == "dis_ep3")
+    assert ep3.status == MatchStatus.NOT_DETECTED
+    assert ep3.is_measured is False
+    assert ep3.matched_source_id is None
+    assert ep3.photometry_status in ["forced_aperture", "upper_limit"]
+
+@pytest.mark.synthetic
+def test_ambiguous_candidates_excluded_from_fit_and_measured_status(tmp_path):
+    """
+    Requirement 4 & 5:
+    Ambiguous candidates are strictly marked is_measured = False and excluded from
+    the trajectory fit until explicitly accepted by user review.
+    """
+    p1 = tmp_path / "fit_ep1.fits"
+    p2 = tmp_path / "fit_ep2.fits"
+
+    create_custom_test_fits(p1, ra_center=120.0, dec_center=15.0, date_obs_iso="2025-05-01T00:00:00",
+                            sources=[{"x": 64.0, "y": 64.0, "peak": 80.0}], obs_id="fit_ep1")
+    create_custom_test_fits(p2, ra_center=120.0, dec_center=15.0, date_obs_iso="2025-05-02T00:00:00",
+                            sources=[
+                                {"x": 64.0, "y": 64.0, "peak": 80.0},
+                                {"x": 72.0, "y": 64.0, "peak": 80.0}
+                            ], obs_id="fit_ep2")
+
+    fits_service.parse_fits_file(p1, observation_id="fit_ep1")
+    fits_service.parse_fits_file(p2, observation_id="fit_ep2")
+
+    obs1 = fits_service.get_observation("fit_ep1")
+    srcs1 = source_detection_service.detect_sources("fit_ep1", obs1["data"], obs1["wcs"], bunit="MJy/sr").sources
+
+    track = trajectory_service.track_source(TrackSourceTaskRequest(
+        reference_observation_id="fit_ep1",
+        reference_source_id=srcs1[0].id,
+        matching_radius_arcsec=60.0
+    ))
+
+    assert track.quality_status == TrajectoryQualityStatus.AMBIGUOUS
+    assert track.detected_epochs_count == 1
+    assert track.missed_epochs_count == 1
+
+    ep2 = next(ep for ep in track.timeline if ep.observation_id == "fit_ep2")
+    assert ep2.status == MatchStatus.AMBIGUOUS_MATCH
+    assert ep2.is_measured is False
+    assert ep2.residual_arcsec is None
+    assert ep2.matched_source_id is None
+    assert len(ep2.competing_candidates) >= 2
+
+    # Now accept candidate
+    chosen_id = ep2.competing_candidates[0]["source_id"]
+    updated = trajectory_service.accept_candidate(track.track_id, "fit_ep2", chosen_id)
+
+    assert updated.detected_epochs_count == 2
+    assert updated.missed_epochs_count == 0
+    ep2_updated = next(ep for ep in updated.timeline if ep.observation_id == "fit_ep2")
+    assert ep2_updated.status == MatchStatus.LIKELY_MATCH
+    assert ep2_updated.is_measured is True
+    assert ep2_updated.matched_source_id == chosen_id
+    assert ep2_updated.residual_arcsec is not None
