@@ -9,6 +9,23 @@ from photutils.background import Background2D, MedianBackground
 
 from app.schemas.observation import DetectedSource, SourceListResponse
 
+# SPHEREx Data Quality Bitmask: Mask only lethal/bad pixels and transients/outliers.
+# Preserves Bit 21 (MP_SOURCE = 0x200000, known catalog source), Bit 12 (MP_FULLSAMPLE),
+# and informational bits (MP_REFERENCE, MP_DICHROIC, MP_PHANTOM).
+BAD_PIXEL_MASK = (
+    (1 << 0)   # MP_TRANSIENT
+    | (1 << 1)  # MP_OVERFLOW
+    | (1 << 2)  # MP_SUR_ERROR
+    | (1 << 6)  # MP_NONFUNC
+    | (1 << 9)  # MP_MISSING_DATA
+    | (1 << 10) # MP_HOT
+    | (1 << 11) # MP_COLD
+    | (1 << 14) # MP_PHANMISS
+    | (1 << 15) # MP_NONLINEAR
+    | (1 << 17) # MP_PERSIST
+    | (1 << 19) # MP_OUTLIER
+)
+
 class SourceDetectionService:
     """
     Detects candidate astronomical sources from 2D scientific FITS arrays
@@ -18,8 +35,13 @@ class SourceDetectionService:
     def __init__(self):
         self._cache: Dict[str, SourceListResponse] = {}
 
-    def clear_cache(self):
-        self._cache.clear()
+    def clear_cache(self, observation_id: Optional[str] = None):
+        if observation_id:
+            keys_to_del = [k for k in self._cache if k.startswith(f"{observation_id}_")]
+            for k in keys_to_del:
+                self._cache.pop(k, None)
+        else:
+            self._cache.clear()
 
     @staticmethod
     def generate_stable_source_id(obs_id: str, px: float, py: float) -> str:
@@ -53,7 +75,7 @@ class SourceDetectionService:
         finite_mask = np.isfinite(arr)
 
         if flag_mask is not None:
-            finite_mask = finite_mask & (flag_mask == 0)
+            finite_mask = finite_mask & ((flag_mask & BAD_PIXEL_MASK) == 0)
 
         if not np.any(finite_mask) or np.sum(finite_mask) < 25:
             return SourceListResponse(

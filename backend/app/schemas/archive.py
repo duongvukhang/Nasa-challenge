@@ -15,8 +15,8 @@ class ArchiveSearchParams(BaseModel):
 class ArchiveRecord(BaseModel):
     obs_id: str
     filename: str
-    ra_deg: float
-    dec_deg: float
+    ra_deg: Optional[float] = None
+    dec_deg: Optional[float] = None
     date_obs: Optional[str] = None
     mjd_obs: Optional[float] = None
     band: Optional[str] = None

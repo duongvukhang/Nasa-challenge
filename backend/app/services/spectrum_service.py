@@ -8,9 +8,9 @@ from app.services.coordinate_service import coordinate_service
 class SpectralPoint(BaseModel):
     wavelength_um: Optional[float] = None
     bandwidth_um: Optional[float] = None
-    flux: float
+    flux: Optional[float] = None
     flux_error: Optional[float] = None
-    flux_unit: str = "MJy/sr"
+    flux_unit: Optional[str] = "MJy/sr"
     band: str
     observation_id: str
     date_obs: Optional[str] = None
@@ -18,6 +18,7 @@ class SpectralPoint(BaseModel):
     pixel_y: float
     is_valid: bool = True
     is_calibrated: bool = False
+    calibration_label: str = "uncalibrated"
 
 class SpectralExtractionResponse(BaseModel):
     target_ra_deg: Optional[float] = None
@@ -146,7 +147,7 @@ class SpectrumService:
                 SpectralPoint(
                     wavelength_um=w_um,
                     bandwidth_um=b_um,
-                    flux=round(val, 4) if np.isfinite(val) else 0.0,
+                    flux=round(val, 4) if np.isfinite(val) else None,
                     flux_error=err,
                     flux_unit=meta.bunit,
                     band=meta.band or "LVF",
@@ -155,7 +156,8 @@ class SpectrumService:
                     pixel_x=round(target_px, 1),
                     pixel_y=round(target_py, 1),
                     is_valid=bool(np.isfinite(val)),
-                    is_calibrated=is_cal
+                    is_calibrated=is_cal,
+                    calibration_label="approximate (WCS-WAVE)" if is_cal else "uncalibrated"
                 )
             )
 
@@ -187,7 +189,7 @@ class SpectrumService:
                         SpectralPoint(
                             wavelength_um=ow_um,
                             bandwidth_um=ob_um,
-                            flux=round(oval, 4) if np.isfinite(oval) else 0.0,
+                            flux=round(oval, 4) if np.isfinite(oval) else None,
                             flux_error=oerr,
                             flux_unit=other_meta.bunit,
                             band=other_meta.band or "LVF",
@@ -196,7 +198,8 @@ class SpectrumService:
                             pixel_x=round(opx, 1),
                             pixel_y=round(opy, 1),
                             is_valid=bool(np.isfinite(oval)),
-                            is_calibrated=o_cal
+                            is_calibrated=o_cal,
+                            calibration_label="approximate (WCS-WAVE)" if o_cal else "uncalibrated"
                         )
                     )
 
@@ -211,7 +214,7 @@ class SpectrumService:
 
         notes = [
             "Measurements represent surface brightness at the source pixel coordinates.",
-            "Wavelength and bandwidth values are calibrated using bivariate lookup from HDU 6 (WCS-WAVE) where present.",
+            "Wavelength and bandwidth values are approximated from bivariate lookup table HDU 6 (WCS-WAVE) where present.",
             "SPHEREx detectors use Linear Variable Filters where wavelength varies across each focal plane array.",
             "Values from simulated demonstrations are approximations labeled as uncalibrated."
         ]

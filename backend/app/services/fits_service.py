@@ -217,9 +217,7 @@ class FITSService:
         date_obs = (
             (provenance_notes.get("date_obs") if provenance_notes else None) or
             header.get("DATE-OBS") or
-            primary_header.get("DATE-OBS") or
-            header.get("DATE") or
-            primary_header.get("DATE")
+            primary_header.get("DATE-OBS")
         )
         mjd_obs = (
             (provenance_notes.get("mjd_obs") if provenance_notes else None) or
@@ -242,8 +240,8 @@ class FITSService:
                 warnings.append("Could not compute ISO timestamp from MJD-OBS header value.")
 
         # Telescope & Instrument
-        telescope = header.get("TELESCOP") or primary_header.get("TELESCOP") or "SPHEREx"
-        instrument = header.get("INSTRUME") or primary_header.get("INSTRUME") or "SPHEREx Infrared Spectrophotometer"
+        telescope = header.get("TELESCOP") or primary_header.get("TELESCOP")
+        instrument = header.get("INSTRUME") or primary_header.get("INSTRUME")
         band = header.get("FILTER") or primary_header.get("FILTER") or header.get("BAND") or primary_header.get("BAND")
         
         # Authentic SPHEREx Level 2 products use DETECTOR header or filename indicators (e.g. D1-D6)
@@ -256,8 +254,11 @@ class FITSService:
             if m:
                 band = f"LVF{m.group(1)}"
 
-        exptime = header.get("EXPTIME") or primary_header.get("EXPTIME")
-        bunit = header.get("BUNIT") or primary_header.get("BUNIT") or "MJy/sr"
+        exptime = (
+            header.get("XPOSURE") or primary_header.get("XPOSURE") or
+            header.get("EXPTIME") or primary_header.get("EXPTIME")
+        )
+        bunit = header.get("BUNIT") or primary_header.get("BUNIT")
         target_name = header.get("OBJECT") or primary_header.get("OBJECT") or header.get("TARGNAME") or primary_header.get("TARGNAME")
 
         # Band / Wavelength mapping
@@ -295,14 +296,14 @@ class FITSService:
             observation_id=obs_id,
             filename=filepath.name,
             target_name=target_name,
-            telescope=str(telescope),
+            telescope=str(telescope) if telescope else None,
             instrument=str(instrument) if instrument else None,
             band=str(band) if band else None,
             wavelength_range_um=wavelength_range,
             date_obs=str(date_obs) if date_obs else None,
             mjd_obs=float(mjd_obs) if mjd_obs is not None else None,
             exposure_time_sec=float(exptime) if exptime is not None else None,
-            bunit=str(bunit),
+            bunit=str(bunit) if bunit else None,
             image_shape=[raw_data.shape[0], raw_data.shape[1]],
             science_hdu_index=science_hdu_idx,
             science_hdu_name=science_hdu_name,

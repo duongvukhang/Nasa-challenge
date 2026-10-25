@@ -163,7 +163,7 @@ export const TopToolbar = ({
                 ? "bg-cyan-500/30 text-cyan-300 font-bold"
                 : "text-slate-400 hover:text-slate-200"
             }`}
-            title="Side-by-Side Synchronized Comparison"
+            title="Side-by-Side Pixel-Synchronized Comparison"
           >
             <Columns2 className="w-3 h-3" />
             <span className="text-[11px]">Split</span>

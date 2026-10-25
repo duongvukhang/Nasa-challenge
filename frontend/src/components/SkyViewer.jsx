@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from "react";
+import React, { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import {
   ZoomIn,
   ZoomOut,
@@ -154,30 +154,23 @@ export const SkyViewer = ({
     setIsDragging(false);
   };
 
-  if (!observation) {
-    return (
-      <div className="w-full h-full flex flex-col items-center justify-center bg-space-950 text-center select-none relative p-6">
-        <div className="w-16 h-16 rounded-2xl bg-cyan-950/40 border border-cyan-500/20 flex items-center justify-center text-cyan-400 mb-4 shadow-cyan-glow">
-          <Compass className="w-8 h-8 opacity-70 animate-pulse" />
-        </div>
-        <h2 className="text-base font-bold text-white tracking-widest uppercase mb-1">
-          SPHEREx Observatory Standby
-        </h2>
-        <p className="text-xs text-slate-400 max-w-md mb-6 leading-relaxed">
-          Open the left sidebar or select from the top actions to explore real infrared observations or simulated demonstrations.
-        </p>
-      </div>
-    );
-  }
-
-  const [imgH, imgW] = observation.image_shape || [2048, 2048];
+  const [imgH, imgW] = observation?.image_shape || [2048, 2048];
 
   // Compile all active tracks (supporting multiple simultaneous tracks)
-  const allTrackList = Object.values(tracks).length > 0
-    ? Object.values(tracks)
-    : (trackData ? [trackData] : []);
+  const allTrackList = useMemo(() => {
+    return Object.values(tracks).length > 0
+      ? Object.values(tracks)
+      : (trackData ? [trackData] : []);
+  }, [tracks, trackData]);
 
-  const visibleTrackList = allTrackList.filter((tr) => tr && !hiddenTrackIds.has(tr.track_id));
+  const visibleTrackList = useMemo(() => {
+    return allTrackList.filter((tr) => tr && !hiddenTrackIds.has(tr.track_id));
+  }, [allTrackList, hiddenTrackIds]);
+
+  // Clear projected coords map when active observation changes
+  useEffect(() => {
+    setProjectedCoordsMap({});
+  }, [observation?.observation_id]);
 
   // Batch project all celestial coordinates via backend Astropy WCS
   useEffect(() => {
@@ -220,7 +213,23 @@ export const SkyViewer = ({
     return () => {
       isSubscribed = false;
     };
-  }, [observation?.observation_id, visibleTrackList, predictionData, imgH]);
+  }, [observation?.observation_id, observation?.wcs?.has_wcs, visibleTrackList, predictionData, imgH]);
+
+  if (!observation) {
+    return (
+      <div className="w-full h-full flex flex-col items-center justify-center bg-space-950 text-center select-none relative p-6">
+        <div className="w-16 h-16 rounded-2xl bg-cyan-950/40 border border-cyan-500/20 flex items-center justify-center text-cyan-400 mb-4 shadow-cyan-glow">
+          <Compass className="w-8 h-8 opacity-70 animate-pulse" />
+        </div>
+        <h2 className="text-base font-bold text-white tracking-widest uppercase mb-1">
+          SPHEREx Observatory Standby
+        </h2>
+        <p className="text-xs text-slate-400 max-w-md mb-6 leading-relaxed">
+          Open the left sidebar or select from the top actions to explore real infrared observations or simulated demonstrations.
+        </p>
+      </div>
+    );
+  }
 
   // Helper to accurately project celestial coordinates or epoch pixel positions
   // into the CURRENT displayed observation's SVG pixel space.

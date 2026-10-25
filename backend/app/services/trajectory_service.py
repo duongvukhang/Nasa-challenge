@@ -22,7 +22,7 @@ from app.schemas.tracking import (
 from app.schemas.observation import ObservationMetadata
 from app.services.coordinate_service import coordinate_service
 from app.services.fits_service import fits_service
-from app.services.source_detection import source_detection_service
+from app.services.source_detection import source_detection_service, BAD_PIXEL_MASK
 
 # Stable, visually distinct 8-color palette for tracks
 TRACK_PALETTE = [
@@ -95,7 +95,7 @@ def perform_forced_aperture_photometry(
 
     if flags is not None:
         sub_flags = flags[y_min:y_max, x_min:x_max]
-        valid_mask = sub_finite & (sub_flags == 0)
+        valid_mask = sub_finite & ((sub_flags & BAD_PIXEL_MASK) == 0)
     else:
         valid_mask = sub_finite
 

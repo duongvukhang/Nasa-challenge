@@ -256,20 +256,20 @@ class IRSAClient:
                     b_name = band_info.get("name", f"Band {det}" if det else "LVF")
                     c_um = band_info.get("center_um")
                     w_range = [band_info["min_um"], band_info["max_um"]] if band_info else None
-                    crval = entry.get("crval") or [params.ra_deg, params.dec_deg]
+                    crval = entry.get("crval")
 
                     rec = ArchiveRecord(
                         obs_id=entry["obs_id"],
                         filename=Path(entry["local_path"]).name,
-                        ra_deg=round(crval[0], 6),
-                        dec_deg=round(crval[1], 6),
+                        ra_deg=round(crval[0], 6) if crval else None,
+                        dec_deg=round(crval[1], 6) if crval else None,
                         date_obs=entry.get("date_obs"),
                         mjd_obs=entry.get("mjd_obs"),
                         band=b_name,
                         detector=det,
                         wavelength_center_um=c_um,
                         wavelength_range_um=w_range,
-                        access_url=entry.get("source_url") or f"https://irsa.ipac.caltech.edu/data/SPHEREx/level2/{entry['obs_id']}.fits",
+                        access_url=entry.get("source_url"),
                         filesize_bytes=entry.get("filesize_bytes"),
                         data_release=entry.get("version"),
                         product_type="Level 2 Science Image",

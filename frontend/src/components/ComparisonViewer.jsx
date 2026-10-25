@@ -198,6 +198,7 @@ export const ComparisonViewer = ({
                   <span className="text-slate-300">{targetObservation.date_obs.slice(0, 10)}</span>
                 </>
               )}
+              <span className="text-[9px] text-slate-400 bg-white/5 px-1.5 py-0.5 rounded hidden xl:inline">Pixel-Synchronized</span>
             </div>
 
             {/* Canvas Image */}
@@ -233,6 +234,7 @@ export const ComparisonViewer = ({
                   <span className="text-slate-300">{referenceObservation.date_obs.slice(0, 10)}</span>
                 </>
               )}
+              <span className="text-[9px] text-slate-400 bg-white/5 px-1.5 py-0.5 rounded hidden xl:inline">Pixel-Synchronized</span>
             </div>
 
             {/* Canvas Image (Synchronously Panned & Zoomed) */}

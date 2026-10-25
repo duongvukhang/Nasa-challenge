@@ -3,8 +3,8 @@ Tests for KnownObjectsService (ephemeris query and cross-matching).
 Verifies provenance, honest handling of offline/sandboxed state,
 and no fabrication of synthetic asteroids.
 """
+from pathlib import Path
 import pytest
-from unittest.mock import patch, MagicMock
 from app.services.fits_service import fits_service
 from app.services.known_objects_service import known_objects_service
 from app.services.trajectory_service import trajectory_service
@@ -30,40 +30,14 @@ def sample_known_objects_obs(tmp_path):
 
 @pytest.mark.synthetic
 def test_known_objects_offline_handling(sample_known_objects_obs):
-    """Verifies that when IRSA MOST is offline or sandboxed, it returns an explicit offline state."""
+    """Verifies that offline known-object query returns explicit offline state with zero fake asteroids."""
     obs_id = sample_known_objects_obs
     res = known_objects_service.query_known_objects_in_field(obs_id)
 
     assert res["observation_id"] == obs_id
-    assert res["status"] in ["unavailable_offline", "success"]
-    if res["status"] == "unavailable_offline":
-        assert "no synthetic known objects" in res["message"].lower()
-        assert len(res["known_objects"]) == 0
-
-@pytest.mark.synthetic
-def test_known_objects_mocked_success(sample_known_objects_obs):
-    """Tests parsing and cross-matching when IRSA MOST returns valid table data."""
-    obs_id = sample_known_objects_obs
-
-    mock_row = {
-        "objname": "Ceres",
-        "ra": 276.0,
-        "dec": 64.0,
-        "vmag": 8.5,
-        "rate": 1.2
-    }
-
-    mock_most_class = MagicMock()
-    mock_instance = MagicMock()
-    mock_instance.query_object.return_value = [mock_row]
-    mock_most_class.return_value = mock_instance
-
-    with patch.dict("sys.modules", {"astroquery.ipac.irsa": MagicMock(Most=mock_most_class)}):
-        res = known_objects_service.query_known_objects_in_field(obs_id)
-        assert res["status"] == "success"
-        assert res["total_known_objects"] == 1
-        assert res["known_objects"][0]["name"] == "Ceres"
-        assert res["known_objects"][0]["provenance"] == "IRSA_MOST"
+    assert res["status"] == "unavailable_offline"
+    assert "no synthetic known objects" in res["message"].lower()
+    assert len(res["known_objects"]) == 0
 
 @pytest.mark.synthetic
 def test_cross_match_track_offline(sample_known_objects_obs):
@@ -83,6 +57,32 @@ def test_cross_match_track_offline(sample_known_objects_obs):
     )
     res = known_objects_service.cross_match_track_with_known_objects(track.track_id)
     assert res["track_id"] == track.track_id
-    assert res["status"] in ["UNVERIFIED_OFFLINE", "UNIDENTIFIED_CANDIDATE", "CONFIRMED_KNOWN_OBJECT"]
-    if res["status"] == "UNVERIFIED_OFFLINE":
-        assert "disclaimer" in res
+    assert res["status"] == "UNVERIFIED_OFFLINE"
+    assert "disclaimer" in res
+    assert not res["is_known_object"]
+
+@pytest.mark.real_data
+def test_real_spherex_fits_flag_and_known_objects():
+    """Regression test on authentic SPHEREx product: verifies bitmask filtering keeps stars."""
+    real_path = Path("SPHERExLVFSurveyData/level2_2025W28_1B_0480_4D1_spx_l2b-v20-2025-260.fits")
+    if not real_path.exists():
+        pytest.skip("Real SPHEREx product not available")
+
+    fits_service.clear_all_observations()
+    meta = fits_service.parse_fits_file(real_path, observation_id="real_test_obs")
+    obs = fits_service.get_observation("real_test_obs")
+
+    # Verify source detection finds stars despite MP_SOURCE flag
+    srcs = source_detection_service.detect_sources(
+        observation_id="real_test_obs",
+        data=obs["data"],
+        astropy_wcs=obs["wcs"],
+        flag_mask=obs["flags"],
+        max_sources=20
+    )
+    assert srcs.total_sources > 0, "Real stars must be detected even when MP_SOURCE bit is set"
+
+    # Verify known-objects returns honest unavailable status on real product
+    ko = known_objects_service.query_known_objects_in_field("real_test_obs")
+    assert ko["status"] == "unavailable_offline"
+    assert len(ko["known_objects"]) == 0

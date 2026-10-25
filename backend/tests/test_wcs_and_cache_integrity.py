@@ -59,7 +59,7 @@ def test_cache_index_hash_verification(tmp_path):
     detects modified/corrupted files, and provides spatial polygon containment queries.
     """
     p = tmp_path / "cache_test.fits"
-    create_custom_test_fits(p, ra_center=180.0, dec_center=0.0)
+    create_custom_test_fits(p, ra_center=180.0, dec_center=0.0, obs_id="test_cache_obs")
 
     # Validate file and get metadata
     meta = cache_index.validate_file_and_get_metadata(p)

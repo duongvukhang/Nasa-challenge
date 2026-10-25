@@ -33,14 +33,14 @@ class ObservationMetadata(BaseModel):
     observation_id: str
     filename: str
     target_name: Optional[str] = None
-    telescope: str = "SPHEREx"
+    telescope: Optional[str] = None
     instrument: Optional[str] = None
     band: Optional[str] = None  # e.g., 'LVF1', 'LVF2', etc.
     wavelength_range_um: Optional[List[float]] = None  # [min_um, max_um]
     date_obs: Optional[str] = None  # ISO timestamp
     mjd_obs: Optional[float] = None
     exposure_time_sec: Optional[float] = None
-    bunit: Optional[str] = "MJy/sr"
+    bunit: Optional[str] = None
     image_shape: List[int] = Field(..., description="[height, width]")
     science_hdu_index: int
     science_hdu_name: str

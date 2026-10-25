@@ -34,7 +34,8 @@ def create_custom_test_fits(
     sources: list = None,
     has_wcs: bool = True,
     width: int = 128,
-    height: int = 128
+    height: int = 128,
+    obs_id: str = None
 ):
     """Generates a controlled FITS file with specific sources and WCS for deterministic testing."""
     rng = np.random.default_rng(42)
@@ -51,6 +52,8 @@ def create_custom_test_fits(
     primary = fits.PrimaryHDU()
     primary.header["TELESCOP"] = "SPHEREx"
     primary.header["SIMULATD"] = True
+    if obs_id:
+        primary.header["OBSID"] = obs_id
 
     sci = fits.ImageHDU(data=data, name="SCI")
     sci.header["BUNIT"] = "MJy/sr"

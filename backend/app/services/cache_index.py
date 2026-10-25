@@ -122,13 +122,16 @@ class CacheIndex:
                 mjd_obs = float(mjd_obs)
 
             # Validate identity match if expected
-            if expected_obs_id and obs_id:
-                # Normalise for comparisons (e.g. 2025W18_1B_0001_1 vs 2025W18_1B_0001_1_D1)
-                exp_clean = expected_obs_id.replace("spherex_", "").replace(".fits", "")
-                obs_clean = str(obs_id).replace("spherex_", "").replace(".fits", "")
-                if not (exp_clean in obs_clean or obs_clean in exp_clean or exp_clean.startswith(obs_clean)):
+            if expected_obs_id:
+                if not obs_id:
+                    raise ValueError(f"Product lacks OBSID keyword in header: {filepath}")
+                exp_clean = expected_obs_id.replace("spherex_", "").replace(".fits", "").strip()
+                obs_clean = str(obs_id).replace("spherex_", "").replace(".fits", "").strip()
+                det_suffix = f"_{det_str}" if det_str else ""
+                expected_matches = {obs_clean, f"{obs_clean}{det_suffix}"}
+                if exp_clean not in expected_matches:
                     raise ValueError(
-                        f"Product identity mismatch: file contains OBSID '{obs_id}', expected '{expected_obs_id}'"
+                        f"Product identity mismatch: file contains OBSID '{obs_id}' detector '{det_str}', expected '{expected_obs_id}'"
                     )
 
             # WCS & Footprint Polygon
@@ -207,17 +210,13 @@ class CacheIndex:
         with self._lock:
             entry = self._entries.get(obs_id)
             if not entry:
-                # Try finding without detector suffix or with prefix
-                for k, v in self._entries.items():
-                    if obs_id in k or k in obs_id:
-                        entry = v
-                        break
-            if not entry:
                 return None
 
-            # Verify file still exists on disk
+            # Verify file still exists on disk and re-verify SHA-256
             p = Path(entry["local_path"])
             if not p.exists() or p.stat().st_size != entry["filesize_bytes"]:
+                return None
+            if self.compute_sha256(p) != entry["sha256"]:
                 return None
             return entry
 
@@ -227,7 +226,8 @@ class CacheIndex:
             for k, e in self._entries.items():
                 p = Path(e["local_path"])
                 if p.exists() and p.stat().st_size == e["filesize_bytes"]:
-                    valid.append(e)
+                    if self.compute_sha256(p) == e["sha256"]:
+                        valid.append(e)
             return valid
 
     @staticmethod
@@ -242,9 +242,9 @@ class CacheIndex:
         # Simple tangent projection or 2D winding with RA wrap handling
         n = len(poly)
         inside = False
-        p1_ra, p1_dec = poly[0]
-        for i in range(n + 1):
-            p2_ra, p2_dec = poly[i % n]
+        for i in range(n):
+            p1_ra, p1_dec = poly[i]
+            p2_ra, p2_dec = poly[(i + 1) % n]
             # Handle RA wrapping near 0 / 360
             dra = p2_ra - p1_ra
             if dra > 180.0:
@@ -261,9 +261,8 @@ class CacheIndex:
             if min(p1_dec, p2_dec) < dec_deg <= max(p1_dec, p2_dec):
                 if p1_dec != p2_dec:
                     xinters = (dec_deg - p1_dec) * (p2_ra - p1_ra) / (p2_dec - p1_dec) + p1_ra
-                    if p1_ra == p2_ra or q_ra <= xinters:
+                    if q_ra <= xinters:
                         inside = not inside
-            p1_ra, p1_dec = p2_ra, p2_dec
 
         return inside
 
@@ -318,16 +317,22 @@ class CacheIndex:
                         if self.angular_sep_deg(ra_deg, dec_deg, v_ra, v_dec) <= radius_deg:
                             overlaps = True
                             break
-                    # 3. Distance from circle center to center of polygon <= radius + nominal semi-diagonal (~2.5 deg)
-                    if not overlaps and crval:
-                        dist_to_center = self.angular_sep_deg(ra_deg, dec_deg, crval[0], crval[1])
-                        # Conservative edge check: SPHEREx FOV is 3.5 deg x 3.5 deg -> semi-diagonal ~ 2.47 deg
-                        if dist_to_center <= (radius_deg + 2.5):
-                            overlaps = True
+                    # 3. Check polygon edge segment sampling for small search circles crossing edge
+                    if not overlaps:
+                        n_poly = len(poly)
+                        for i in range(n_poly):
+                            p1 = poly[i]
+                            p2 = poly[(i + 1) % n_poly]
+                            # Sample midpoint of each edge
+                            mid_ra = (p1[0] + p2[0]) / 2.0
+                            mid_dec = (p1[1] + p2[1]) / 2.0
+                            if self.angular_sep_deg(ra_deg, dec_deg, mid_ra, mid_dec) <= radius_deg:
+                                overlaps = True
+                                break
             elif crval:
-                # Fallback to center distance if polygon is missing
+                # Fallback only when polygon is absent: nominal detector radius ~ 1.8 deg
                 dist = self.angular_sep_deg(ra_deg, dec_deg, crval[0], crval[1])
-                if dist <= (radius_deg + 2.5):
+                if dist <= (radius_deg + 1.8):
                     overlaps = True
 
             if overlaps:
