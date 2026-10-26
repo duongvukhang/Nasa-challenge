@@ -214,6 +214,7 @@ def delete_observation(observation_id: str):
     if not success:
         raise HTTPException(status_code=404, detail=f"Observation '{observation_id}' not found.")
     source_detection_service.clear_cache(observation_id)
+    difference_service.invalidate_observation(observation_id)
     return {"status": "deleted", "observation_id": observation_id}
 
 @router.delete("")
@@ -223,6 +224,7 @@ def clear_all_observations():
     """
     count = fits_service.clear_all_observations()
     source_detection_service.clear_cache()
+    difference_service.clear_cache()
     return {"status": "cleared", "total_removed": count}
 
 @router.get("/{observation_id}/difference")

@@ -18,7 +18,8 @@ import {
   Sparkles,
   Download,
   RotateCcw,
-  RotateCw
+  RotateCw,
+  Info
 } from "lucide-react";
 import { api } from "../services/api";
 import { getStableTrackColor } from "../utils/colors";
@@ -35,6 +36,37 @@ export const TrajectoryInspector = ({
   onStopInspect = null
 }) => {
   const [activeTab, setActiveTab] = useState("timeline"); // "timeline" | "fit" | "missed"
+  const [exportError, setExportError] = useState(null);
+  const [isExporting, setIsExporting] = useState(false);
+
+  const handleExport = async (format) => {
+    try {
+      setIsExporting(true);
+      setExportError(null);
+      const res = await fetch(api.getTrackExportUrl(track.track_id, format));
+      if (!res.ok) {
+        let msg = `Export failed with status ${res.status}`;
+        try {
+          const errJson = await res.json();
+          if (errJson.detail) msg = errJson.detail;
+        } catch (_) {}
+        throw new Error(msg);
+      }
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${track.display_name ? track.display_name.replace(/\s+/g, "_") : track.track_id}.${format}`;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+    } catch (err) {
+      setExportError(err.message || "Failed to download export");
+    } finally {
+      setIsExporting(false);
+    }
+  };
 
   if (!isOpen || !track) return null;
 
@@ -143,24 +175,24 @@ export const TrajectoryInspector = ({
             </button>
 
             {/* Export Dropdown / Buttons */}
-            <a
-              href={api.getTrackExportUrl(track.track_id, "csv")}
-              download={`${track.track_id}.csv`}
-              className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-white/10 text-slate-200 transition-colors flex items-center space-x-1 text-xs"
+            <button
+              onClick={() => handleExport("csv")}
+              disabled={isExporting}
+              className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-white/10 text-slate-200 transition-colors flex items-center space-x-1 text-xs disabled:opacity-50"
               title="Export verifiable track table as CSV"
             >
               <Download className="w-3 h-3 text-cyan-400" />
               <span>CSV</span>
-            </a>
-            <a
-              href={api.getTrackExportUrl(track.track_id, "json")}
-              download={`${track.track_id}.json`}
-              className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-white/10 text-slate-200 transition-colors flex items-center space-x-1 text-xs"
+            </button>
+            <button
+              onClick={() => handleExport("json")}
+              disabled={isExporting}
+              className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-white/10 text-slate-200 transition-colors flex items-center space-x-1 text-xs disabled:opacity-50"
               title="Export complete provenance and astrometry as JSON"
             >
               <Download className="w-3 h-3 text-cyan-400" />
               <span>JSON</span>
-            </a>
+            </button>
 
             <button
               onClick={() => onOpenSkyPlot?.(track)}
@@ -260,6 +292,17 @@ export const TrajectoryInspector = ({
             </span>
           </div>
         </div>
+
+        {/* Export Error Alert if any */}
+        {exportError && (
+          <div className="px-4 py-2 bg-rose-950/60 border-b border-rose-500/30 text-[11px] text-rose-300 flex items-center justify-between">
+            <div className="flex items-center space-x-1.5">
+              <AlertCircle className="w-3.5 h-3.5 shrink-0 text-rose-400" />
+              <span>Export Failed: {exportError}</span>
+            </div>
+            <button onClick={() => setExportError(null)} className="text-rose-400 hover:text-white text-xs">Dismiss</button>
+          </div>
+        )}
 
         {/* Scientific Integrity Disclaimer Banner */}
         <div className="px-4 py-2 bg-amber-950/30 border-b border-amber-500/20 text-[10px] text-amber-300/90 flex items-center justify-between">

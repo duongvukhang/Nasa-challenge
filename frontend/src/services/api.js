@@ -296,7 +296,7 @@ export const api = {
   },
 
   async crossMatchTrack(trackId, matchingRadiusArcsec = 15.0) {
-    const res = await fetch(`${API_BASE}/api/tracks/${trackId}/cross-match?matching_radius_arcsec=${matchingRadiusArcsec}`);
+    const res = await fetch(`${API_BASE}/api/tracking/tracks/${trackId}/cross-match?matching_radius_arcsec=${matchingRadiusArcsec}`);
     if (!res.ok) throw new Error("Failed to cross-match track with known objects");
     return res.json();
   }

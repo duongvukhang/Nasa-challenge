@@ -48,8 +48,8 @@ class MatchedEpoch(BaseModel):
     matched_source_id: Optional[str] = Field(None, description="Identifier of the matched source in target observation")
     candidate_count: int = Field(0, description="Number of candidate sources within search radius")
     competing_candidates: Optional[List[Dict[str, Any]]] = Field(None, description="List of competing candidate sources if ambiguous")
-    confidence_score: float = Field(..., description="Documented heuristic score between 0.0 and 1.0 (not a calibrated probability)")
-    confidence_rationale: str = Field(..., description="Plain-language scientific explanation of the score")
+    confidence_score: float = Field(0.0, description="Documented heuristic score between 0.0 and 1.0 (not a calibrated probability)")
+    confidence_rationale: str = Field("", description="Plain-language scientific explanation of the score")
     position_uncertainty_arcsec: float = Field(0.5, description="Positional 1-sigma error ellipse radius")
     is_measured: bool = Field(False, description="True only if supported by real detection in this epoch")
     photometry_status: Optional[str] = Field(None, description="'measured', 'forced_aperture', 'upper_limit', or 'unavailable'")
@@ -69,7 +69,7 @@ class TrajectoryFitInfo(BaseModel):
     max_residual_sigma: Optional[float] = Field(None, description="Maximum normalized residual across all detections")
     reduced_chi2: Optional[float] = Field(None, description="Reduced chi-squared goodness of fit")
     degrees_of_freedom: Optional[int] = Field(None, description="Degrees of freedom in model fit")
-    fit_assessment: str = Field(..., description="Scientific plain-language evaluation of the model fit")
+    fit_assessment: str = Field("", description="Scientific plain-language evaluation of the model fit")
     disclaimer: str = Field(
         "Statistical motion candidate does not establish orbit determination or celestial body identification.",
         description="Scientific integrity disclaimer"
@@ -96,7 +96,7 @@ class MultiEpochTrack(BaseModel):
     quality_status: TrajectoryQualityStatus
     quality_rationale: str
     fit_info: TrajectoryFitInfo
-    validation_info: TrajectoryValidationInfo
+    validation_info: TrajectoryValidationInfo = Field(default_factory=TrajectoryValidationInfo)
     timeline: List[MatchedEpoch]
     created_at: Optional[str] = None
     history: List[Dict[str, Any]] = Field(default_factory=list, description="Audit log of user modifications / state changes")
@@ -126,6 +126,10 @@ class TrackSourceTaskRequest(BaseModel):
 class AcceptCandidateRequest(BaseModel):
     observation_id: str
     candidate_source_id: str
+
+class RejectCandidateRequest(BaseModel):
+    observation_id: str
+    candidate_source_id: Optional[str] = Field(None, description="Candidate ID to reject, or omit to reject all candidates in epoch")
 
 class ProposeMatchRequest(BaseModel):
     observation_id: str

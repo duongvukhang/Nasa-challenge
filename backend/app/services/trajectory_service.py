@@ -20,6 +20,7 @@ from app.schemas.tracking import (
     SourceTrackResponse
 )
 from app.schemas.observation import ObservationMetadata
+from app.config import settings
 from app.services.coordinate_service import coordinate_service
 from app.services.fits_service import fits_service
 from app.services.source_detection import source_detection_service, BAD_PIXEL_MASK
@@ -42,7 +43,7 @@ MOTION_PRIOR_RATES = {
     "fast_mover": 30.0   # <= 30.0"/day (e.g. near-Earth asteroid, comet)
 }
 
-TRACKS_STORE_PATH = Path("backend/data/tracks.json")
+TRACKS_STORE_PATH = settings.TRACKS_STORE_PATH
 
 def get_stable_track_color(track_id: str) -> str:
     """
@@ -166,9 +167,19 @@ class TrajectoryService:
     3+ detections required for motion model consistency.
     """
 
-    def __init__(self):
+    def __init__(self, store_path: Optional[Path] = None):
+        self._store_path: Path = store_path or settings.TRACKS_STORE_PATH
         self._tracks: Dict[str, MultiEpochTrack] = {}
         self._max_allocated_track_number: int = 0
+        self._load_persisted_tracks()
+
+    def set_store_path(self, path: Path):
+        """Sets an isolated persistence location (e.g. for testing) and reloads tracks."""
+        self._store_path = Path(path)
+        global TRACKS_STORE_PATH
+        TRACKS_STORE_PATH = self._store_path
+        self._tracks.clear()
+        self._max_allocated_track_number = 0
         self._load_persisted_tracks()
 
     def _allocate_display_name(self) -> str:
@@ -187,11 +198,11 @@ class TrajectoryService:
         return f"Track {self._max_allocated_track_number:03d}"
 
     def _load_persisted_tracks(self):
-        """Loads persisted tracks from disk on startup if available."""
-        if TRACKS_STORE_PATH.exists():
+        """Loads persisted tracks from disk on startup if available, protecting corrupt files."""
+        if self._store_path.exists():
             try:
                 import re
-                with open(TRACKS_STORE_PATH, "r", encoding="utf-8") as f:
+                with open(self._store_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     for tr_dict in data:
                         tr = MultiEpochTrack(**tr_dict)
@@ -202,20 +213,29 @@ class TrajectoryService:
                             if m:
                                 self._max_allocated_track_number = max(self._max_allocated_track_number, int(m.group(1)))
                         self._tracks[tr.track_id] = tr
-            except Exception:
-                pass
+            except Exception as e:
+                # Protect corrupt persisted state: backup instead of silently destroying
+                try:
+                    import shutil
+                    from datetime import datetime, timezone
+                    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+                    corrupt_path = self._store_path.with_suffix(f".corrupt.{ts}")
+                    shutil.copy2(self._store_path, corrupt_path)
+                except Exception:
+                    pass
 
     def _save_tracks(self):
-        """Atomically persists tracks to disk."""
+        """Atomically persists tracks to disk via tempfile and rename."""
         try:
-            TRACKS_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = TRACKS_STORE_PATH.with_suffix(".json.tmp")
+            self._store_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self._store_path.with_suffix(".json.tmp")
             data = [tr.model_dump() for tr in self._tracks.values()]
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
-            os.replace(tmp_path, TRACKS_STORE_PATH)
-        except Exception:
-            pass
+            os.replace(tmp_path, self._store_path)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error("Failed to persist tracks to %s: %s", self._store_path, e)
 
     def list_tracks(self) -> List[MultiEpochTrack]:
         return list(self._tracks.values())
@@ -331,8 +351,8 @@ class TrajectoryService:
         x_vec = dra_u.to(u.arcsec).value
         y_vec = ddec_u.to(u.arcsec).value
 
-        poly_x, cov_x = np.polyfit(dt_vec, x_vec, 1, w=1.0/eff_uncs, cov=True)
-        poly_y, cov_y = np.polyfit(dt_vec, y_vec, 1, w=1.0/eff_uncs, cov=True)
+        poly_x, cov_x = np.polyfit(dt_vec, x_vec, 1, w=1.0/eff_uncs, cov="unscaled")
+        poly_y, cov_y = np.polyfit(dt_vec, y_vec, 1, w=1.0/eff_uncs, cov="unscaled")
 
         dt_target = target_mjd - t0
         x_pred = float(poly_x[0] * dt_target + poly_x[1])
@@ -901,7 +921,8 @@ class TrajectoryService:
     def accept_candidate(self, track_id: str, observation_id: str, candidate_source_id: str) -> MultiEpochTrack:
         """
         Accepts a specific candidate in an ambiguous epoch and updates trajectory fit.
-        Appends action to history and clears redo stack.
+        Applies strict validation: association envelope check, cross-track conflict prevention,
+        complete field resets, downstream recomputation, and bounded undo/redo history.
         """
         track = self.get_track(track_id)
         if not track:
@@ -911,13 +932,29 @@ class TrajectoryService:
         if not target_ep:
             raise ValueError(f"Observation '{observation_id}' not found in track timeline.")
 
-        # Check competing candidates
+        if target_ep.observation_id == track.reference_observation_id:
+            raise ValueError("Reference starting epoch detection cannot be altered via candidate acceptance.")
+
+        # 1. Conflict Prevention across tracks: ensure detection is not claimed by another track
+        for other_id, other_track in self._tracks.items():
+            if other_id == track_id:
+                continue
+            for other_ep in other_track.timeline:
+                if (
+                    other_ep.observation_id == observation_id
+                    and other_ep.matched_source_id == candidate_source_id
+                    and other_ep.is_measured
+                    and other_ep.status == MatchStatus.LIKELY_MATCH
+                ):
+                    other_name = other_track.display_name or other_id
+                    raise ValueError(f"Candidate '{candidate_source_id}' is already claimed by track '{other_name}'.")
+
+        # 2. Check competing candidates or fetch from observation detection
         chosen = None
         if target_ep.competing_candidates:
             chosen = next((c for c in target_ep.competing_candidates if c["source_id"] == candidate_source_id), None)
 
         if not chosen:
-            # Fall back to checking detection service
             rec = fits_service.get_observation(observation_id)
             if rec:
                 resp = source_detection_service.detect_sources(
@@ -929,6 +966,19 @@ class TrajectoryService:
                 )
                 src = next((s for s in resp.sources if s.id == candidate_source_id), None)
                 if src:
+                    # Enforce association region: candidate must be reasonably near predicted / reference coordinate
+                    pred_ra = target_ep.predicted_ra_deg if target_ep.predicted_ra_deg is not None else track.reference_ra_deg
+                    pred_dec = target_ep.predicted_dec_deg if target_ep.predicted_dec_deg is not None else track.reference_dec_deg
+                    c_pred = SkyCoord(ra=pred_ra * u.deg, dec=pred_dec * u.deg, frame="icrs")
+                    c_src = SkyCoord(ra=src.ra_deg * u.deg, dec=src.dec_deg * u.deg, frame="icrs")
+                    dist_arcsec = float(c_pred.separation(c_src).arcsec)
+
+                    if dist_arcsec > 180.0:
+                        raise ValueError(
+                            f"Candidate '{candidate_source_id}' is {dist_arcsec:.1f}\" from prediction, "
+                            "exceeding valid physical association region."
+                        )
+
                     chosen = {
                         "source_id": src.id,
                         "pixel_x": src.pixel_x,
@@ -936,38 +986,136 @@ class TrajectoryService:
                         "ra_deg": src.ra_deg,
                         "dec_deg": src.dec_deg,
                         "snr": src.snr,
-                        "flux": src.peak_flux
+                        "flux": src.peak_flux,
+                        "fwhm_pixels": src.fwhm_pixels,
+                        "position_uncertainty_arcsec": src.position_uncertainty_arcsec or 0.3
                     }
 
         if not chosen:
             raise ValueError(f"Candidate '{candidate_source_id}' not found in observation '{observation_id}'.")
 
-        # Snapshot current state for undo
+        # 3. Snapshot state without recursive history nesting (bounded history)
         snapshot = track.model_dump()
+        snapshot.pop("history", None)
+        snapshot.pop("redo_stack", None)
         track.history.append({
             "action": "accept_candidate",
             "observation_id": observation_id,
             "candidate_source_id": candidate_source_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "previous_state": snapshot
         })
+        if len(track.history) > 20:
+            track.history = track.history[-20:]
         track.redo_stack.clear()
 
-        # Update target epoch
+        # 4. Update target epoch with fresh candidate values (do not carry over previous candidate metrics)
         target_ep.matched_source_id = chosen["source_id"]
         target_ep.pixel_x = chosen["pixel_x"]
         target_ep.pixel_y = chosen["pixel_y"]
         target_ep.ra_deg = chosen["ra_deg"]
         target_ep.dec_deg = chosen["dec_deg"]
+        target_ep.flux = chosen.get("flux")
+        target_ep.flux_uncertainty = chosen.get("flux_uncertainty")
+        target_ep.upper_limit_3sigma = None  # Clear forced upper limit
+        target_ep.snr = chosen.get("snr")
+        target_ep.fwhm_pixels = chosen.get("fwhm_pixels")
+        target_ep.position_uncertainty_arcsec = float(chosen.get("position_uncertainty_arcsec") or 0.3)
+        target_ep.photometry_status = "measured"
         target_ep.status = MatchStatus.LIKELY_MATCH
         target_ep.is_measured = True
+        target_ep.confidence_score = 1.0
         target_ep.confidence_rationale = f"User-confirmed candidate match: {candidate_source_id}."
 
         ref_c = SkyCoord(ra=track.reference_ra_deg * u.deg, dec=track.reference_dec_deg * u.deg, frame="icrs")
         if chosen["ra_deg"] is not None and chosen["dec_deg"] is not None:
             cand_c = SkyCoord(ra=chosen["ra_deg"] * u.deg, dec=chosen["dec_deg"] * u.deg, frame="icrs")
-            target_ep.separation_arcsec = round(float(ref_c.separation(cand_c).arcsec), 3)
+            sep_arcsec = float(ref_c.separation(cand_c).arcsec)
+            target_ep.separation_arcsec = round(sep_arcsec, 3)
+            comb_unc = math.sqrt(track.reference_position_uncertainty_arcsec**2 + target_ep.position_uncertainty_arcsec**2)
+            target_ep.separation_sigma = round(sep_arcsec / comb_unc, 2) if comb_unc > 0 else 1.0
 
-        # Re-evaluate trajectory with accepted measurements only
+        # 5. Re-evaluate trajectory fit with all accepted measurements
+        detected_epochs = [
+            {
+                "obs_id": ep.observation_id,
+                "mjd": ep.mjd_obs,
+                "ra": ep.ra_deg,
+                "dec": ep.dec_deg,
+                "unc": ep.position_uncertainty_arcsec,
+                "matched_epoch": ep
+            }
+            for ep in track.timeline if ep.is_measured and ep.status == MatchStatus.LIKELY_MATCH and ep.ra_deg is not None
+        ]
+        detected_epochs.sort(key=lambda x: x["mjd"] if x["mjd"] is not None else 0.0)
+
+        fit_info, q_status, q_rationale = self._evaluate_trajectory_quality(
+            detected_epochs=detected_epochs,
+            total_eligible=track.total_eligible_epochs,
+            timeline=track.timeline,
+            ref_c=ref_c
+        )
+        track.fit_info = fit_info
+        track.quality_status = q_status
+        track.quality_rationale = q_rationale
+        track.detected_epochs_count = len(detected_epochs)
+        track.missed_epochs_count = track.total_eligible_epochs - len(detected_epochs)
+
+        self._tracks[track_id] = track
+        self._save_tracks()
+        return track
+
+    def reject_candidate(self, track_id: str, observation_id: str, candidate_source_id: Optional[str] = None) -> MultiEpochTrack:
+        """
+        Explicitly rejects candidate match in an ambiguous or reviewed epoch.
+        Prevents silent re-entry without re-evaluation and recalculates trajectory.
+        """
+        track = self.get_track(track_id)
+        if not track:
+            raise ValueError(f"Track '{track_id}' not found.")
+
+        target_ep = next((ep for ep in track.timeline if ep.observation_id == observation_id), None)
+        if not target_ep:
+            raise ValueError(f"Observation '{observation_id}' not found in track timeline.")
+
+        if target_ep.observation_id == track.reference_observation_id:
+            raise ValueError("Reference starting epoch detection cannot be rejected.")
+
+        # Snapshot state without recursive nesting
+        snapshot = track.model_dump()
+        snapshot.pop("history", None)
+        snapshot.pop("redo_stack", None)
+        track.history.append({
+            "action": "reject_candidate",
+            "observation_id": observation_id,
+            "candidate_source_id": candidate_source_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "previous_state": snapshot
+        })
+        if len(track.history) > 20:
+            track.history = track.history[-20:]
+        track.redo_stack.clear()
+
+        # Remove candidate if specified
+        if candidate_source_id and target_ep.competing_candidates:
+            target_ep.competing_candidates = [
+                c for c in target_ep.competing_candidates if c.get("source_id") != candidate_source_id
+            ]
+
+        # If no candidates remain or whole epoch rejected, mark as NOT_DETECTED
+        if not candidate_source_id or not target_ep.competing_candidates:
+            target_ep.status = MatchStatus.NOT_DETECTED
+            target_ep.is_measured = False
+            target_ep.matched_source_id = None
+            target_ep.candidate_count = 0
+            target_ep.confidence_score = 0.0
+            target_ep.confidence_rationale = "Candidate rejected by user review; no detection accepted."
+            target_ep.photometry_status = "upper_limit"
+        else:
+            target_ep.candidate_count = len(target_ep.competing_candidates)
+
+        # Re-evaluate trajectory
+        ref_c = SkyCoord(ra=track.reference_ra_deg * u.deg, dec=track.reference_dec_deg * u.deg, frame="icrs")
         detected_epochs = [
             {
                 "obs_id": ep.observation_id,
@@ -998,7 +1146,7 @@ class TrajectoryService:
         return track
 
     def undo_track(self, track_id: str) -> Optional[MultiEpochTrack]:
-        """Reverts the last modification to the track."""
+        """Reverts the last modification to the track without recursive history growth."""
         track = self.get_track(track_id)
         if not track or len(track.history) <= 1:
             return None
@@ -1006,7 +1154,12 @@ class TrajectoryService:
         last_action = track.history.pop()
         prev_state = last_action.get("previous_state")
         if prev_state:
-            track.redo_stack.append(track.model_dump())
+            curr_state = track.model_dump()
+            curr_state.pop("history", None)
+            curr_state.pop("redo_stack", None)
+            track.redo_stack.append(curr_state)
+            if len(track.redo_stack) > 20:
+                track.redo_stack = track.redo_stack[-20:]
             restored = MultiEpochTrack(**prev_state)
             restored.history = track.history
             restored.redo_stack = track.redo_stack
@@ -1016,17 +1169,22 @@ class TrajectoryService:
         return track
 
     def redo_track(self, track_id: str) -> Optional[MultiEpochTrack]:
-        """Re-applies the undone action to the track."""
+        """Re-applies the undone action to the track without recursive history growth."""
         track = self.get_track(track_id)
         if not track or not track.redo_stack:
             return None
 
         next_state = track.redo_stack.pop()
+        curr_state = track.model_dump()
+        curr_state.pop("history", None)
+        curr_state.pop("redo_stack", None)
         track.history.append({
             "action": "redo",
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "previous_state": track.model_dump()
+            "previous_state": curr_state
         })
+        if len(track.history) > 20:
+            track.history = track.history[-20:]
         restored = MultiEpochTrack(**next_state)
         restored.history = track.history
         restored.redo_stack = track.redo_stack
@@ -1196,8 +1354,8 @@ class TrajectoryService:
         rate_hour = None
 
         if dt_days_total > 0.01:
-            poly_x, cov_x = np.polyfit(dt_vec, x_arcsec, 1, w=1.0/eff_uncs, cov=True)
-            poly_y, cov_y = np.polyfit(dt_vec, y_arcsec, 1, w=1.0/eff_uncs, cov=True)
+            poly_x, cov_x = np.polyfit(dt_vec, x_arcsec, 1, w=1.0/eff_uncs, cov="unscaled")
+            poly_y, cov_y = np.polyfit(dt_vec, y_arcsec, 1, w=1.0/eff_uncs, cov="unscaled")
             fit_x = np.polyval(poly_x, dt_vec)
             fit_y = np.polyval(poly_y, dt_vec)
 
@@ -1287,10 +1445,18 @@ class TrajectoryService:
 
             rms_mot = float(np.sqrt(np.mean(res_mot_arcsec**2)))
             max_sig = float(np.max(res_mot_sigma))
+            is_statistically_verified = (
+                n_det >= 3
+                and not has_ambiguity
+                and dt_days_total >= 0.01
+                and v_sig >= 3.0
+                and red_chi2_mot <= 2.5
+                and max_sig <= 3.0
+            )
 
             fit_info = TrajectoryFitInfo(
                 fit_model=FitModelType.LINEAR_MOTION,
-                is_verified_motion=True,
+                is_verified_motion=is_statistically_verified,
                 proper_motion_mas_yr=pm_mas_yr,
                 proper_motion_uncertainty_mas_yr=pm_unc_mas_yr,
                 rate_arcsec_day=rate_day,
@@ -1302,8 +1468,12 @@ class TrajectoryService:
                 reduced_chi2=round(float(red_chi2_mot), 2),
                 degrees_of_freedom=dof_mot,
                 fit_assessment=(
-                    f"Linear apparent motion across {n_det} epochs with velocity significance {v_sig:.1f}σ. "
-                    f"Apparent velocity: {pm_mas_yr} mas/yr ({rate_day}\"/day) at PA {pos_ang:.1f}°. Residual RMS: {rms_mot:.2f}\" (χ²_red = {red_chi2_mot:.2f})."
+                    f"Linear apparent motion across {n_det} epochs (significance {v_sig:.1f}σ, χ²_red = {red_chi2_mot:.2f}). "
+                    f"{'Statistically consistent linear motion model.' if is_statistically_verified else 'Heuristic motion candidate requiring further confirmation epochs.'}"
+                ),
+                disclaimer=(
+                    "Statistical motion candidate does not establish orbit determination, gravitational bound state, "
+                    "or Planet X discovery. Requires external ephemeris and reflex parallax verification."
                 )
             )
 
@@ -1314,7 +1484,7 @@ class TrajectoryService:
                     "Ambiguous association: Multiple candidate sources found in at least one observation epoch."
                 )
 
-            if red_chi2_mot <= 2.5 and max_sig <= 3.0:
+            if is_statistically_verified:
                 return (
                     fit_info,
                     TrajectoryQualityStatus.STRONG_MATCH,

@@ -50,6 +50,11 @@ export const PredictionModal = ({
       return;
     }
 
+    if (currentObservation?.mjd_obs == null) {
+      setError("Active observation lacks a valid calibrated timestamp (MJD-OBS). Prediction requires a verified observation epoch.");
+      return;
+    }
+
     setLoading(true);
     setError(null);
 
@@ -58,7 +63,7 @@ export const PredictionModal = ({
         reference_observation_id: currentObservation.observation_id,
         target_ra_deg: selectedSource.ra_deg,
         target_dec_deg: selectedSource.dec_deg,
-        target_time_mjd: currentObservation.mjd_obs || 60793.0,
+        target_time_mjd: currentObservation.mjd_obs,
         pm_ra_cosdec_arcsec_day: parseFloat(pmRa) || 0.0,
         pm_dec_arcsec_day: parseFloat(pmDec) || 0.0,
         extrapolation_days: parseFloat(days) || 5.0,
@@ -218,26 +223,37 @@ export const PredictionModal = ({
             {/* Verification result */}
             {prediction.verification && (
               <div
-                className={`p-2 rounded border ${
-                  prediction.verification.detected
+                className={`p-2.5 rounded-lg border font-mono ${
+                  prediction.verification.is_consistent_with_model || prediction.verification.detected
                     ? "bg-emerald-950/40 border-emerald-500/40 text-emerald-200"
-                    : prediction.verification.status === "outside_coverage"
+                    : (prediction.verification.coverage_status === "outside_coverage" || prediction.verification.status === "outside_coverage")
                     ? "bg-slate-900/60 border-slate-700 text-slate-300"
                     : "bg-amber-950/40 border-amber-500/40 text-amber-200"
                 }`}
               >
-                <div className="flex items-center space-x-1 font-bold">
-                  {prediction.verification.detected ? (
-                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                <div className="flex items-center space-x-1.5 font-bold text-xs">
+                  {(prediction.verification.is_consistent_with_model || prediction.verification.detected) ? (
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
                   ) : (
-                    <AlertTriangle className="w-3.5 h-3.5 text-amber-400" />
+                    <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
                   )}
-                  <span>Status: {prediction.verification.status}</span>
+                  <span>Coverage Status: {prediction.verification.coverage_status || prediction.verification.status}</span>
                 </div>
-                <div className="text-[10px] mt-1 space-y-0.5">
-                  <div>Predicted: ({prediction.verification.predicted_ra?.toFixed(4)}°, {prediction.verification.predicted_dec?.toFixed(4)}°)</div>
-                  {prediction.verification.closest_source_separation_arcsec != null && (
-                    <div>Closest Source Sep: {prediction.verification.closest_source_separation_arcsec.toFixed(2)}″</div>
+                <div className="text-[10px] mt-1.5 space-y-1">
+                  <div>Predicted: ({(prediction.verification.predicted_ra_deg ?? prediction.verification.predicted_ra)?.toFixed(4)}°, {(prediction.verification.predicted_dec_deg ?? prediction.verification.predicted_dec)?.toFixed(4)}°)</div>
+                  {prediction.verification.observed_ra_deg != null && (
+                    <div>Observed: ({prediction.verification.observed_ra_deg?.toFixed(4)}°, {prediction.verification.observed_dec_deg?.toFixed(4)}°)</div>
+                  )}
+                  {(prediction.verification.angular_residual_arcsec != null || prediction.verification.closest_source_separation_arcsec != null) && (
+                    <div>
+                      Separation: {(prediction.verification.angular_residual_arcsec ?? prediction.verification.closest_source_separation_arcsec)?.toFixed(2)}″
+                      {prediction.verification.residual_sigma != null && ` (${prediction.verification.residual_sigma.toFixed(1)}σ)`}
+                    </div>
+                  )}
+                  {prediction.verification.assessment && (
+                    <div className="pt-1 text-slate-300 border-t border-white/5 font-sans leading-relaxed">
+                      {prediction.verification.assessment}
+                    </div>
                   )}
                 </div>
               </div>

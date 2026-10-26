@@ -104,11 +104,11 @@ export const SpectrumDrawer = ({
                   <XAxis
                     dataKey="wavelength"
                     tick={{ fill: "#94a3b8", fontSize: 10 }}
-                    tickFormatter={(v) => `${v.toFixed(2)}µm`}
+                    tickFormatter={(v) => (v != null && !isNaN(v) ? `${Number(v).toFixed(2)}µm` : "")}
                   />
                   <YAxis
                     tick={{ fill: "#94a3b8", fontSize: 10 }}
-                    tickFormatter={(v) => v.toFixed(1)}
+                    tickFormatter={(v) => (v != null && !isNaN(v) ? Number(v).toFixed(1) : "")}
                   />
                   <Tooltip
                     content={({ active, payload }) => {
@@ -116,9 +116,11 @@ export const SpectrumDrawer = ({
                         const pt = payload[0].payload;
                         return (
                           <div className="stellarium-glass-dark border border-white/15 p-2 rounded shadow-xl text-[10px] font-mono space-y-0.5">
-                            <div className="text-cyan-400 font-bold">λ: {pt.wavelength} µm</div>
-                            <div className="text-white">Surface Brightness: {pt.flux} MJy/sr</div>
-                            <div className="text-slate-400">Detector Channel: {pt.band}</div>
+                            <div className="text-cyan-400 font-bold">
+                              λ: {pt.wavelength != null ? `${Number(pt.wavelength).toFixed(3)} µm` : "Uncalibrated"}
+                            </div>
+                            <div className="text-white">Surface Brightness: {pt.flux != null ? `${Number(pt.flux).toFixed(2)} MJy/sr` : "N/A"}</div>
+                            <div className="text-slate-400">Detector Channel: {pt.band || "LVF"}</div>
                           </div>
                         );
                       }
@@ -138,8 +140,13 @@ export const SpectrumDrawer = ({
             </div>
 
             <div className="flex items-center justify-between text-[10px] text-slate-400 px-1 font-sans">
-              <span>Wavelength: {chartData[0]?.wavelength.toFixed(2)} µm — {chartData[chartData.length - 1]?.wavelength.toFixed(2)} µm</span>
-              <span className="text-cyan-400 font-mono">Unit: MJy/sr (Surface Brightness)</span>
+              <span>
+                Wavelength:{" "}
+                {chartData[0]?.wavelength != null && chartData[chartData.length - 1]?.wavelength != null
+                  ? `${Number(chartData[0].wavelength).toFixed(2)} µm — ${Number(chartData[chartData.length - 1].wavelength).toFixed(2)} µm`
+                  : "Uncalibrated / Single Band"}
+              </span>
+              <span className="text-cyan-400 font-mono">Unit: MJy/sr (Focal Plane Surface Brightness)</span>
             </div>
           </div>
         )}

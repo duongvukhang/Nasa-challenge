@@ -13,9 +13,12 @@ def test_difference_service_validation_and_computation(tmp_path):
     - Rejects disparate surface brightness units
     - Rejects incompatible spectral channels (e.g. LVF1 vs LVF2)
     - Rejects non-overlapping sky footprints
+    - Returns both 'available' and 'compatible' for frontend-backend contract symmetry
+    - Invalidates cache upon observation deletion
     - Computes valid residual array and statistics when observations overlap
     """
     fits_service.clear_all_observations()
+    difference_service.clear_cache()
 
     # 1. Compatible overlapping epochs
     p1 = tmp_path / "diff_ep1.fits"
@@ -28,6 +31,7 @@ def test_difference_service_validation_and_computation(tmp_path):
 
     res = difference_service.get_difference("diff_ep2", "diff_ep1")
     assert res["available"] is True
+    assert res["compatible"] is True
     assert res["overlap_fraction"] > 0.9
     assert "mean_difference" in res
 
@@ -38,12 +42,18 @@ def test_difference_service_validation_and_computation(tmp_path):
 
     res_far = difference_service.get_difference("diff_far", "diff_ep1")
     assert res_far["available"] is False
+    assert res_far["compatible"] is False
     assert "overlap" in res_far["reason"].lower()
+
+    # 3. Cache invalidation on observation removal
+    difference_service.invalidate_observation("diff_ep1")
+    assert "diff_ep2_diff_ep1" not in difference_service._cache
 
 @pytest.mark.synthetic
 def test_difference_api_endpoints(tmp_path):
     """Verifies HTTP endpoints for difference metadata and PNG rendering."""
     fits_service.clear_all_observations()
+    difference_service.clear_cache()
     client = TestClient(app)
 
     p1 = tmp_path / "api_diff1.fits"
@@ -58,6 +68,7 @@ def test_difference_api_endpoints(tmp_path):
     assert resp.status_code == 200
     data = resp.json()
     assert data["available"] is True
+    assert data["compatible"] is True
 
     # Image rendering endpoint
     resp_img = client.get("/api/observations/api_diff2/difference-image?ref_obs_id=api_diff1")

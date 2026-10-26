@@ -352,7 +352,21 @@ export const ComparisonViewer = ({
             </div>
           )}
 
-          {!diffLoading && diffMeta?.compatible === false && (
+          {diffError && (
+            <div className="max-w-md stellarium-glass-dark rounded-2xl p-6 border border-rose-500/40 shadow-2xl text-center space-y-4 font-mono">
+              <div className="w-12 h-12 rounded-full bg-rose-950/60 border border-rose-500/40 flex items-center justify-center text-rose-400 mx-auto">
+                <AlertTriangle className="w-6 h-6" />
+              </div>
+              <h3 className="text-sm font-bold text-white uppercase tracking-wider">
+                Difference Calculation Failed
+              </h3>
+              <p className="text-xs text-rose-200/90 leading-relaxed bg-rose-950/40 p-3 rounded-lg border border-rose-900/50">
+                {diffError}
+              </p>
+            </div>
+          )}
+
+          {!diffLoading && !diffError && (diffMeta?.compatible === false || diffMeta?.available === false) && (
             <div className="max-w-md stellarium-glass-dark rounded-2xl p-6 border border-amber-500/40 shadow-2xl text-center space-y-4 font-mono">
               <div className="w-12 h-12 rounded-full bg-amber-950/60 border border-amber-500/40 flex items-center justify-center text-amber-400 mx-auto">
                 <AlertTriangle className="w-6 h-6" />
@@ -387,7 +401,7 @@ export const ComparisonViewer = ({
             </div>
           )}
 
-          {!diffLoading && diffMeta?.compatible === true && (
+          {!diffLoading && !diffError && (diffMeta?.compatible === true || diffMeta?.available === true) && (
             <>
               {/* Header Info */}
               <div className="absolute top-14 left-1/2 -translate-x-1/2 z-20 stellarium-glass rounded-full px-4 py-1.5 flex items-center space-x-3 text-xs font-mono shadow-2xl border border-cyan-500/30">

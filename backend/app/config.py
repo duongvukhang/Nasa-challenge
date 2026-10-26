@@ -9,10 +9,11 @@ class Settings:
     
     # Base directories
     BASE_DIR: Path = Path(__file__).resolve().parent.parent
-    DATA_DIR: Path = BASE_DIR / "data"
+    DATA_DIR: Path = Path(os.getenv("SKYTRACE_DATA_DIR", str(BASE_DIR / "data")))
     UPLOADS_DIR: Path = DATA_DIR / "uploads"
     SAMPLES_DIR: Path = DATA_DIR / "samples"
     CACHE_DIR: Path = DATA_DIR / "cache"
+    TRACKS_STORE_PATH: Path = Path(os.getenv("SKYTRACE_TRACKS_STORE_PATH", str(DATA_DIR / "tracks.json")))
     
     # Upload limits: 150 MB max
     MAX_UPLOAD_SIZE_BYTES: int = int(os.getenv("MAX_UPLOAD_SIZE_BYTES", str(150 * 1024 * 1024)))

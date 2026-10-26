@@ -24,11 +24,11 @@ class DifferenceService:
 
         target_obs = fits_service.get_observation(target_obs_id)
         if not target_obs:
-            return {"available": False, "reason": f"Target observation '{target_obs_id}' not found."}
+            return {"available": False, "compatible": False, "reason": f"Target observation '{target_obs_id}' not found."}
 
         ref_obs = fits_service.get_observation(ref_obs_id)
         if not ref_obs:
-            return {"available": False, "reason": f"Reference observation '{ref_obs_id}' not found."}
+            return {"available": False, "compatible": False, "reason": f"Reference observation '{ref_obs_id}' not found."}
 
         target_meta = target_obs["metadata"]
         ref_meta = ref_obs["metadata"]
@@ -37,6 +37,7 @@ class DifferenceService:
         if target_meta.bunit != ref_meta.bunit:
             return {
                 "available": False,
+                "compatible": False,
                 "reason": f"Incompatible units: target has '{target_meta.bunit}', reference has '{ref_meta.bunit}'."
             }
 
@@ -44,6 +45,7 @@ class DifferenceService:
         if target_meta.band and ref_meta.band and target_meta.band != ref_meta.band:
             return {
                 "available": False,
+                "compatible": False,
                 "reason": f"Incompatible spectral bands: target is '{target_meta.band}', reference is '{ref_meta.band}'. Difference imaging requires matching spectral channels."
             }
 
@@ -51,11 +53,13 @@ class DifferenceService:
         if not target_meta.wcs.has_wcs or target_obs["wcs"] is None:
             return {
                 "available": False,
+                "compatible": False,
                 "reason": f"Target observation '{target_obs_id}' lacks a valid celestial WCS."
             }
         if not ref_meta.wcs.has_wcs or ref_obs["wcs"] is None:
             return {
                 "available": False,
+                "compatible": False,
                 "reason": f"Reference observation '{ref_obs_id}' lacks a valid celestial WCS."
             }
 
@@ -66,8 +70,8 @@ class DifferenceService:
 
         th, tw = tgt_data.shape
 
-        # Downsample grid for fast WCS coordinate mapping if array is large
-        step = 1 if (th <= 512 and tw <= 512) else 2
+        # Use full-resolution grid for accurate astrometric alignment without PSF dipole artifacts
+        step = 1 if (th <= 2048 and tw <= 2048) else 2
         y_coords = np.arange(0, th, step)
         x_coords = np.arange(0, tw, step)
         xx, yy = np.meshgrid(x_coords, y_coords)
@@ -78,12 +82,10 @@ class DifferenceService:
         ref_px, ref_py = ref_wcs.world_to_pixel(sky)
 
         # Interpolate ref_data at (ref_py, ref_px)
-        # map_coordinates requires coordinates array shaped (2, ...) with row indices (y) first
         coords = np.array([ref_py, ref_px])
         reproj_sub = map_coordinates(ref_data, coords, order=1, cval=np.nan)
 
         if step > 1:
-            # Upsample back to full target grid
             from scipy.ndimage import zoom
             reproj_ref = zoom(reproj_sub, (th / reproj_sub.shape[0], tw / reproj_sub.shape[1]), order=1, cval=np.nan)
         else:
@@ -96,6 +98,7 @@ class DifferenceService:
         if overlap_pixels < 100:
             return {
                 "available": False,
+                "compatible": False,
                 "reason": f"No significant spatial overlap between '{target_obs_id}' and '{ref_obs_id}' (overlap: {overlap_pixels} pixels)."
             }
 
@@ -109,6 +112,7 @@ class DifferenceService:
 
         result = {
             "available": True,
+            "compatible": True,
             "target_observation_id": target_obs_id,
             "reference_observation_id": ref_obs_id,
             "overlap_pixels": overlap_pixels,
@@ -122,6 +126,16 @@ class DifferenceService:
 
         self._cache[cache_key] = result
         return result
+
+    def invalidate_observation(self, observation_id: str):
+        """Invalidates all cached difference results involving observation_id."""
+        to_del = [k for k in list(self._cache.keys()) if observation_id in k]
+        for k in to_del:
+            self._cache.pop(k, None)
+
+    def clear_cache(self):
+        """Clears all cached difference products."""
+        self._cache.clear()
 
     def render_difference_png(
         self,

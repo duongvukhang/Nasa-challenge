@@ -155,6 +155,7 @@ export const SkyViewer = ({
   };
 
   const [imgH, imgW] = observation?.image_shape || [2048, 2048];
+  const pixelScale = observation?.wcs?.pixel_scale_arcsec || 6.2;
 
   // Compile all active tracks (supporting multiple simultaneous tracks)
   const allTrackList = useMemo(() => {
@@ -540,6 +541,20 @@ export const SkyViewer = ({
                     vectorEffect="non-scaling-stroke"
                   />
                 )}
+                {/* 1-Sigma Positional Uncertainty Circle when enabled */}
+                {overlaySettings.showUncertainty && (
+                  <circle
+                    cx={coords.x}
+                    cy={coords.y}
+                    r={Math.max(4, (currentEp.position_uncertainty_arcsec || 0.5) / pixelScale)}
+                    fill={`${trackColor}15`}
+                    stroke={trackColor}
+                    strokeWidth={1}
+                    strokeDasharray="2,2"
+                    opacity={0.8}
+                    vectorEffect="non-scaling-stroke"
+                  />
+                )}
                 {/* Main reticle */}
                 <circle
                   cx={coords.x}
@@ -600,6 +615,20 @@ export const SkyViewer = ({
                 }}
                 className="cursor-pointer pointer-events-auto"
               >
+                {/* Ambiguous candidate search / uncertainty boundary */}
+                {overlaySettings.showUncertainty && (
+                  <circle
+                    cx={coords.x}
+                    cy={coords.y}
+                    r={Math.max(8, ((currentEp.prediction_uncertainty_arcsec || currentEp.position_uncertainty_arcsec || 3.0) / pixelScale))}
+                    fill="rgba(245, 158, 11, 0.08)"
+                    stroke="#f59e0b"
+                    strokeWidth={1}
+                    strokeDasharray="3,3"
+                    opacity={0.7}
+                    vectorEffect="non-scaling-stroke"
+                  />
+                )}
                 <circle
                   cx={coords.x}
                   cy={coords.y}
@@ -677,6 +706,21 @@ export const SkyViewer = ({
                       strokeWidth={1}
                       vectorEffect="non-scaling-stroke"
                     />
+                    {/* Prediction uncertainty ellipse */}
+                    {overlaySettings.showUncertainty && (pt.uncertainty_semi_major_arcsec || pt.prediction_uncertainty_arcsec) && (
+                      <ellipse
+                        cx={p2.x}
+                        cy={p2.y}
+                        rx={Math.max(3, (pt.uncertainty_semi_major_arcsec || pt.prediction_uncertainty_arcsec || 1.0) / pixelScale)}
+                        ry={Math.max(2, (pt.uncertainty_semi_minor_arcsec || pt.uncertainty_semi_major_arcsec || pt.prediction_uncertainty_arcsec || 1.0) / pixelScale)}
+                        fill="rgba(245, 158, 11, 0.1)"
+                        stroke="#f59e0b"
+                        strokeWidth={1}
+                        strokeDasharray="2,2"
+                        opacity={0.75}
+                        vectorEffect="non-scaling-stroke"
+                      />
+                    )}
                   </g>
                 );
               })}
@@ -742,6 +786,27 @@ export const SkyViewer = ({
                     strokeDasharray={hasConflict ? "3,2" : undefined}
                     vectorEffect="non-scaling-stroke"
                   />
+
+                  {/* Positional uncertainty circle when enabled */}
+                  {overlaySettings.showUncertainty && (
+                    <circle
+                      cx={screenX}
+                      cy={screenY}
+                      r={Math.max(
+                        3,
+                        (src.position_uncertainty_arcsec ||
+                          (src.fwhm_pixels && src.snr
+                            ? (src.fwhm_pixels / (2.355 * Math.max(1, src.snr))) * pixelScale
+                            : 0.8)) / pixelScale
+                      )}
+                      fill="none"
+                      stroke={hasConflict ? "#f59e0b" : isTrackedConfirmed ? (trackColor || "#38bdf8") : "#22c55e"}
+                      strokeWidth={1}
+                      strokeDasharray="2,2"
+                      opacity={0.6}
+                      vectorEffect="non-scaling-stroke"
+                    />
+                  )}
 
                   {/* Source Label (When enabled, selected, confirmed track, or conflict) */}
                   {(overlaySettings.showLabels || isSelected || isTrackedConfirmed || hasConflict) && (

@@ -20,26 +20,28 @@ export const SkyPlotModal = ({
   const [viewMode, setViewMode] = useState("relative"); // "relative" (arcsec from ref) | "absolute" (deg)
   const [hoveredPoint, setHoveredPoint] = useState(null);
 
-  if (!isOpen || !track) return null;
+  const timeline = track?.timeline || [];
+  const measuredPoints = useMemo(() => {
+    return timeline.filter((ep) => ep && ep.is_measured && ep.ra_deg != null && ep.dec_deg != null);
+  }, [timeline]);
 
-  const trackColor = track.color || getStableTrackColor(track.track_id);
-  const timeline = track.timeline || [];
-  const measuredPoints = timeline.filter((ep) => ep.is_measured && ep.ra_deg != null && ep.dec_deg != null);
-
-  // Compute reference coordinates
-  const refRa = track.reference_ra_deg;
-  const refDec = track.reference_dec_deg;
+  // Reference coordinates
+  const refRa = track?.reference_ra_deg;
+  const refDec = track?.reference_dec_deg;
+  const refObsId = track?.reference_observation_id;
 
   // Transform coordinates for plotting
   // If "relative": dx = -(ra - refRa)*cos(refDec)*3600 (arcsec, East is positive/left), dy = (dec - refDec)*3600
   // If "absolute": x = ra (deg), y = dec (deg)
   const plotData = useMemo(() => {
-    if (measuredPoints.length === 0) return [];
+    if (!isOpen || !track || measuredPoints.length === 0 || refRa == null || refDec == null) {
+      return [];
+    }
 
     const cosDec = Math.cos((refDec * Math.PI) / 180.0) || 1.0;
 
     return measuredPoints.map((ep, idx) => {
-      const isRef = ep.observation_id === track.reference_observation_id;
+      const isRef = ep.observation_id === refObsId;
       const sigmaArcsec = ep.position_uncertainty_arcsec || 0.5;
 
       let x, y, xErr, yErr;
@@ -73,11 +75,11 @@ export const SkyPlotModal = ({
         sigmaArcsec
       };
     });
-  }, [measuredPoints, refRa, refDec, viewMode, track.reference_observation_id]);
+  }, [isOpen, track, measuredPoints, refRa, refDec, refObsId, viewMode]);
 
   // Compute bounding box for SVG canvas (with comfortable padding)
   const bounds = useMemo(() => {
-    if (plotData.length === 0) {
+    if (!isOpen || !track || plotData.length === 0) {
       return { minX: -5, maxX: 5, minY: -5, maxY: 5 };
     }
     let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
@@ -108,7 +110,11 @@ export const SkyPlotModal = ({
       minY: minY - padY,
       maxY: maxY + padY
     };
-  }, [plotData, viewMode]);
+  }, [isOpen, track, plotData, viewMode]);
+
+  if (!isOpen || !track) return null;
+
+  const trackColor = track.color || getStableTrackColor(track.track_id);
 
   // SVG dimensions
   const svgWidth = 600;

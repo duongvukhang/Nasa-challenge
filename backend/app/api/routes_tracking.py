@@ -12,7 +12,9 @@ from app.schemas.tracking import (
     SourceTrackResponse,
     MultiEpochTrack,
     TrackSourceTaskRequest,
-    AcceptCandidateRequest
+    AcceptCandidateRequest,
+    RejectCandidateRequest,
+    MatchStatus
 )
 
 router = APIRouter(prefix="/tracking", tags=["Tracking"])
@@ -130,6 +132,24 @@ def accept_track_candidate(track_id: str, req: AcceptCandidateRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Accept candidate error: {str(e)}")
 
+@router.post("/tracks/{track_id}/reject", response_model=MultiEpochTrack)
+def reject_track_candidate(track_id: str, req: RejectCandidateRequest):
+    """
+    Explicitly rejects an ambiguous or invalid candidate detection for an epoch,
+    preventing silent re-entry and updating trajectory fit.
+    """
+    try:
+        track = trajectory_service.reject_candidate(
+            track_id=track_id,
+            observation_id=req.observation_id,
+            candidate_source_id=req.candidate_source_id
+        )
+        return track
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Reject candidate error: {str(e)}")
+
 @router.get("/tracks/{track_id}/export")
 def export_track_data(
     track_id: str,
@@ -158,6 +178,8 @@ def export_track_data(
             "status",
             "ra_deg",
             "dec_deg",
+            "predicted_ra_deg",
+            "predicted_dec_deg",
             "pos_uncertainty_arcsec",
             "pixel_x",
             "pixel_y",
@@ -169,22 +191,35 @@ def export_track_data(
             "residual_arcsec",
             "separation_arcsec"
         ])
-        for ep in track.timeline:
-            kind = "measured" if ep.is_measured else ("missing" if ep.status in [MatchStatus.NOT_DETECTED, MatchStatus.OUTSIDE_FOV] else "unverified")
+        for ep in (track.timeline or []):
+            if ep.is_measured:
+                kind = "measured"
+            elif ep.status == MatchStatus.AMBIGUOUS_MATCH:
+                kind = "ambiguous"
+            elif ep.status in [MatchStatus.NOT_DETECTED, MatchStatus.OUTSIDE_FOV]:
+                kind = "missing"
+            elif ep.predicted_ra_deg is not None:
+                kind = "predicted"
+            else:
+                kind = "unverified"
+
+            status_str = ep.status.value if hasattr(ep.status, "value") else str(ep.status or "")
             det_id = ep.matched_source_id or ""
             writer.writerow([
                 track.track_id,
                 track.display_name or track.track_id,
-                ep.observation_id,
+                ep.observation_id or "",
                 det_id,
                 det_id,
                 ep.date_obs or "",
                 ep.mjd_obs if ep.mjd_obs is not None else "",
                 kind,
-                ep.status.value,
+                status_str,
                 ep.ra_deg if ep.ra_deg is not None else "",
                 ep.dec_deg if ep.dec_deg is not None else "",
-                ep.position_uncertainty_arcsec,
+                ep.predicted_ra_deg if ep.predicted_ra_deg is not None else "",
+                ep.predicted_dec_deg if ep.predicted_dec_deg is not None else "",
+                ep.position_uncertainty_arcsec if ep.position_uncertainty_arcsec is not None else "",
                 ep.pixel_x if ep.pixel_x is not None else "",
                 ep.pixel_y if ep.pixel_y is not None else "",
                 ep.flux if ep.flux is not None else "",
@@ -205,8 +240,18 @@ def export_track_data(
     # JSON export
     data = track.model_dump()
     data["display_name"] = track.display_name or track.track_id
-    for ep in data["timeline"]:
-        ep["kind"] = "measured" if ep.get("is_measured") else ("missing" if ep.get("status") in [MatchStatus.NOT_DETECTED.value, MatchStatus.OUTSIDE_FOV.value] else "unverified")
+    for ep in data.get("timeline", []):
+        ep_status = ep.get("status")
+        if ep.get("is_measured"):
+            ep["kind"] = "measured"
+        elif ep_status in [MatchStatus.AMBIGUOUS_MATCH, MatchStatus.AMBIGUOUS_MATCH.value]:
+            ep["kind"] = "ambiguous"
+        elif ep_status in [MatchStatus.NOT_DETECTED, MatchStatus.NOT_DETECTED.value, MatchStatus.OUTSIDE_FOV, MatchStatus.OUTSIDE_FOV.value]:
+            ep["kind"] = "missing"
+        elif ep.get("predicted_ra_deg") is not None:
+            ep["kind"] = "predicted"
+        else:
+            ep["kind"] = "unverified"
         ep["detection_id"] = ep.get("matched_source_id")
 
     return Response(
@@ -215,6 +260,7 @@ def export_track_data(
         headers={"Content-Disposition": f'attachment; filename="{track_id}.json"'}
     )
 
+@router.get("/tracks/{track_id}/cross-match")
 @router.get("/{track_id}/cross-match")
 def cross_match_track(
     track_id: str,

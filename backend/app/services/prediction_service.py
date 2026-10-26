@@ -18,6 +18,8 @@ class PredictionService:
     """
 
     def compute_prediction_and_verify(self, req: PredictionRequest) -> PredictionResponse:
+        if req.target_time_mjd is None or math.isnan(req.target_time_mjd) or req.target_time_mjd <= 0:
+            raise ValueError("target_time_mjd must be a valid positive MJD timestamp.")
         if not (0.0 <= req.target_ra_deg <= 360.0):
             raise ValueError(f"target_ra_deg {req.target_ra_deg} is out of bounds [0, 360].")
         if not (-90.0 <= req.target_dec_deg <= 90.0):
@@ -106,10 +108,15 @@ class PredictionService:
                     "delta_days": round(dt_comp, 3),
                     "predicted_ra_deg": round(pred_ra_comp, 6),
                     "predicted_dec_deg": round(pred_dec_comp, 6),
+                    "predicted_ra": round(pred_ra_comp, 6),
+                    "predicted_dec": round(pred_dec_comp, 6),
                     "observed_ra_deg": None,
                     "observed_dec_deg": None,
                     "coverage_status": "unknown_coverage",
+                    "status": "unknown_coverage",
+                    "detected": False,
                     "angular_residual_arcsec": None,
+                    "closest_source_separation_arcsec": None,
                     "residual_sigma": None,
                     "is_consistent_with_model": False,
                     "assessment": "Comparison observation lacks valid celestial WCS; coverage cannot be verified."
@@ -125,10 +132,15 @@ class PredictionService:
                         "delta_days": round(dt_comp, 3),
                         "predicted_ra_deg": round(pred_ra_comp, 6),
                         "predicted_dec_deg": round(pred_dec_comp, 6),
+                        "predicted_ra": round(pred_ra_comp, 6),
+                        "predicted_dec": round(pred_dec_comp, 6),
                         "observed_ra_deg": None,
                         "observed_dec_deg": None,
                         "coverage_status": "outside_coverage",
+                        "status": "outside_coverage",
+                        "detected": False,
                         "angular_residual_arcsec": None,
+                        "closest_source_separation_arcsec": None,
                         "residual_sigma": None,
                         "is_consistent_with_model": False,
                         "assessment": "Predicted coordinate lies outside the verified geometric footprint of comparison observation."
@@ -166,10 +178,15 @@ class PredictionService:
                             "delta_days": round(dt_comp, 3),
                             "predicted_ra_deg": round(pred_ra_comp, 6),
                             "predicted_dec_deg": round(pred_dec_comp, 6),
+                            "predicted_ra": round(pred_ra_comp, 6),
+                            "predicted_dec": round(pred_dec_comp, 6),
                             "observed_ra_deg": round(best_src.ra_deg, 6),
                             "observed_dec_deg": round(best_src.dec_deg, 6),
                             "coverage_status": "detected",
+                            "status": "detected",
+                            "detected": res_sigma <= 3.0,
                             "angular_residual_arcsec": round(best_sep, 3),
+                            "closest_source_separation_arcsec": round(best_sep, 3),
                             "residual_sigma": round(res_sigma, 2),
                             "is_consistent_with_model": res_sigma <= 3.0,
                             "assessment": (
@@ -184,10 +201,15 @@ class PredictionService:
                             "delta_days": round(dt_comp, 3),
                             "predicted_ra_deg": round(pred_ra_comp, 6),
                             "predicted_dec_deg": round(pred_dec_comp, 6),
+                            "predicted_ra": round(pred_ra_comp, 6),
+                            "predicted_dec": round(pred_dec_comp, 6),
                             "observed_ra_deg": None,
                             "observed_dec_deg": None,
                             "coverage_status": "no_detection_in_coverage",
+                            "status": "no_detection_in_coverage",
+                            "detected": False,
                             "angular_residual_arcsec": None,
+                            "closest_source_separation_arcsec": None,
                             "residual_sigma": None,
                             "is_consistent_with_model": False,
                             "assessment": f"Target in usable coverage, but no point source detected above threshold within {search_radius_arcsec:.1f}\" search radius."
