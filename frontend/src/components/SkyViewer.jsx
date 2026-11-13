@@ -22,6 +22,7 @@ export const SkyViewer = ({
   trackData = null,
   predictionData = null,
   centerTarget = null,
+  onSelectObservation = null,
   isLoading = false
 }) => {
   // Zoom & Pan state
@@ -207,11 +208,6 @@ export const SkyViewer = ({
     return map;
   }, [visibleTrackList, observation?.observation_id]);
 
-  // Clear projected coords map when active observation changes
-  useEffect(() => {
-    setProjectedCoordsMap({});
-  }, [observation?.observation_id]);
-
   // Batch project all celestial coordinates via backend Astropy WCS
   useEffect(() => {
     if (!observation?.observation_id || !observation?.wcs?.has_wcs) return;
@@ -220,13 +216,19 @@ export const SkyViewer = ({
     visibleTrackList.forEach((tr) => {
       tr?.timeline?.forEach((ep) => {
         if (ep.ra_deg != null && ep.dec_deg != null) {
-          coordsToProject.push({ ra_deg: ep.ra_deg, dec_deg: ep.dec_deg });
+          const key = `${observation.observation_id}:${ep.ra_deg.toFixed(6)},${ep.dec_deg.toFixed(6)}`;
+          if (!projectedCoordsMap[key]) {
+            coordsToProject.push({ ra_deg: ep.ra_deg, dec_deg: ep.dec_deg });
+          }
         }
       });
     });
     predictionData?.trajectory_points?.forEach((pt) => {
       if (pt.ra_deg != null && pt.dec_deg != null) {
-        coordsToProject.push({ ra_deg: pt.ra_deg, dec_deg: pt.dec_deg });
+        const key = `${observation.observation_id}:${pt.ra_deg.toFixed(6)},${pt.dec_deg.toFixed(6)}`;
+        if (!projectedCoordsMap[key]) {
+          coordsToProject.push({ ra_deg: pt.ra_deg, dec_deg: pt.dec_deg });
+        }
       }
     });
 
@@ -239,12 +241,15 @@ export const SkyViewer = ({
         if (!isSubscribed || !res?.projected) return;
         const mapping = {};
         res.projected.forEach((p) => {
-          const key = `${p.ra_deg.toFixed(6)},${p.dec_deg.toFixed(6)}`;
-          mapping[key] = {
+          const scopedKey = `${observation.observation_id}:${p.ra_deg.toFixed(6)},${p.dec_deg.toFixed(6)}`;
+          const plainKey = `${p.ra_deg.toFixed(6)},${p.dec_deg.toFixed(6)}`;
+          const pos = {
             x: p.pixel_x,
             y: imgH - p.pixel_y,
             inside: p.inside_bounds
           };
+          mapping[scopedKey] = pos;
+          mapping[plainKey] = pos;
         });
         setProjectedCoordsMap((prev) => ({ ...prev, ...mapping }));
       })
@@ -276,13 +281,24 @@ export const SkyViewer = ({
   const getEpochScreenCoords = (ep) => {
     if (!ep) return null;
 
-    if (ep.ra_deg != null && ep.dec_deg != null) {
-      const key = `${ep.ra_deg.toFixed(6)},${ep.dec_deg.toFixed(6)}`;
-      if (projectedCoordsMap[key]) {
-        return projectedCoordsMap[key];
+    // 1. If this epoch is from the active observation, pixel coords are exact!
+    if (ep.observation_id === observation?.observation_id && ep.pixel_x != null && ep.pixel_y != null) {
+      return { x: ep.pixel_x, y: imgH - ep.pixel_y };
+    }
+
+    // 2. Check cached Astropy WCS celestial projection
+    if (ep.ra_deg != null && ep.dec_deg != null && observation?.observation_id) {
+      const scopedKey = `${observation.observation_id}:${ep.ra_deg.toFixed(6)},${ep.dec_deg.toFixed(6)}`;
+      if (projectedCoordsMap[scopedKey]) {
+        return projectedCoordsMap[scopedKey];
+      }
+      const plainKey = `${ep.ra_deg.toFixed(6)},${ep.dec_deg.toFixed(6)}`;
+      if (projectedCoordsMap[plainKey]) {
+        return projectedCoordsMap[plainKey];
       }
     }
 
+    // 3. Fast high-precision tangent plane projection
     if (
       ep.ra_deg != null &&
       ep.dec_deg != null &&
@@ -292,13 +308,16 @@ export const SkyViewer = ({
     ) {
       const degPerPix = (observation.wcs.pixel_scale_arcsec || 6.2) / 3600;
       const cosDec = Math.cos((observation.wcs.crval[1] * Math.PI) / 180) || 1.0;
-      const dx = -(ep.ra_deg - observation.wcs.crval[0]) * cosDec / degPerPix;
+      const dx = -((ep.ra_deg - observation.wcs.crval[0]) * cosDec) / degPerPix;
       const dy = (ep.dec_deg - observation.wcs.crval[1]) / degPerPix;
-      const px = observation.wcs.crpix[0] + dx;
-      const py = imgH - (observation.wcs.crpix[1] + dy);
+      const crpixX = (observation.wcs.crpix[0] || 1024) - 1.0;
+      const crpixY = (observation.wcs.crpix[1] || 1024) - 1.0;
+      const px = crpixX + dx;
+      const py = imgH - (crpixY + dy);
       return { x: px, y: py };
     }
 
+    // 4. Fallback for registered / synthetic images without celestial WCS
     if (ep.pixel_x != null && ep.pixel_y != null) {
       return { x: ep.pixel_x, y: imgH - ep.pixel_y };
     }
@@ -381,17 +400,23 @@ export const SkyViewer = ({
           )}
 
           <defs>
-            <marker
-              id="trajArrow"
-              viewBox="0 0 10 10"
-              refX="6"
-              refY="5"
-              markerWidth="4"
-              markerHeight="4"
-              orient="auto-start-reverse"
-            >
-              <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#22d3ee" />
-            </marker>
+            {visibleTrackList.map((tr) => {
+              const color = tr.color || getStableTrackColor(tr.track_id);
+              return (
+                <marker
+                  key={`marker_${tr.track_id}`}
+                  id={`trajArrow_${tr.track_id}`}
+                  viewBox="0 0 10 10"
+                  refX="8"
+                  refY="5"
+                  markerWidth="5"
+                  markerHeight="5"
+                  orient="auto"
+                >
+                  <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill={color} />
+                </marker>
+              );
+            })}
             <marker
               id="predArrow"
               viewBox="0 0 10 10"
@@ -405,20 +430,23 @@ export const SkyViewer = ({
             </marker>
           </defs>
 
-          {/* 2. Multi-Epoch Tracking Trajectories & Truth-Based Detection Markers */}
+          {/* 2. Multi-Epoch Tracking Trajectories & Directional Path (Epoch A -> Epoch B -> Epoch C) */}
           {overlaySettings.showTrajectories && visibleTrackList.map((tr) => {
             const trackColor = tr.color || getStableTrackColor(tr.track_id);
             const isActive = tr.track_id === activeTrackId;
 
             // Extract measured waypoints reprojected into current field (strictly confirmed matches)
+            // Sorted chronologically by MJD so lines connect Epoch A -> Epoch B -> Epoch C in proper order
             const waypoints = (tr.timeline || [])
-              .filter((ep) => ep.is_measured && ep.status === "Likely match")
-              .map((ep, idx) => {
+              .map((ep, originalIdx) => ({ ep, originalIdx }))
+              .filter(({ ep }) => ep.is_measured && (ep.status === "Likely match" || ep.status === "LIKELY_MATCH"))
+              .sort((a, b) => (a.ep.mjd_obs || 0) - (b.ep.mjd_obs || 0))
+              .map(({ ep, originalIdx }) => {
                 const coords = getEpochScreenCoords(ep);
                 if (!coords) return null;
                 return {
                   ...ep,
-                  epochIdx: idx + 1,
+                  epochIdx: originalIdx + 1,
                   screenX: coords.x,
                   screenY: coords.y,
                   isCurrent: ep.observation_id === observation?.observation_id
@@ -430,37 +458,34 @@ export const SkyViewer = ({
 
             return (
               <g key={`track_overlay_${tr.track_id}`}>
-                {/* Connecting trajectory segments across epochs */}
+                {/* Connecting trajectory segments across epochs: Epoch A -> Epoch B -> Epoch C */}
                 {waypoints.map((pt, idx) => {
                   if (idx === 0) return null;
                   const prev = waypoints[idx - 1];
-                  const isLast = idx === waypoints.length - 1;
 
                   return (
                     <g key={`traj_seg_${tr.track_id}_${idx}`} className="pointer-events-none">
-                      {/* Underlying glow for active track */}
-                      {isActive && (
-                        <line
-                          x1={prev.screenX}
-                          y1={prev.screenY}
-                          x2={pt.screenX}
-                          y2={pt.screenY}
-                          stroke={trackColor}
-                          strokeWidth={2.5}
-                          strokeOpacity={0.25}
-                          vectorEffect="non-scaling-stroke"
-                        />
-                      )}
-                      {/* Trajectory line */}
+                      {/* Underlying atmospheric glow for active trajectory */}
                       <line
                         x1={prev.screenX}
                         y1={prev.screenY}
                         x2={pt.screenX}
                         y2={pt.screenY}
                         stroke={trackColor}
-                        strokeWidth={isActive ? 2.5 : 1.5}
-                        strokeDasharray={isActive ? "5,3" : "4,4"}
-                        strokeOpacity={isActive ? 1.0 : 0.75}
+                        strokeWidth={isActive ? 3.5 : 2.5}
+                        strokeOpacity={isActive ? 0.35 : 0.2}
+                        vectorEffect="non-scaling-stroke"
+                      />
+                      {/* Crisp directional trajectory vector line with arrowhead */}
+                      <line
+                        x1={prev.screenX}
+                        y1={prev.screenY}
+                        x2={pt.screenX}
+                        y2={pt.screenY}
+                        stroke={trackColor}
+                        strokeWidth={isActive ? 2 : 1.5}
+                        strokeOpacity={isActive ? 1.0 : 0.85}
+                        markerEnd={`url(#trajArrow_${tr.track_id})`}
                         vectorEffect="non-scaling-stroke"
                       />
                     </g>
@@ -471,7 +496,30 @@ export const SkyViewer = ({
                 {waypoints.map((pt) => {
                   if (pt.isCurrent) return null; // Current epoch rendered below with full interactive reticle
                   return (
-                    <g key={`traj_wpt_${tr.track_id}_${pt.epochIdx}`} className="pointer-events-none">
+                    <g
+                      key={`traj_wpt_${tr.track_id}_${pt.epochIdx}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onSelectTrack?.(tr.track_id);
+                        if (pt.observation_id && onSelectObservation) {
+                          onSelectObservation(pt.observation_id);
+                        }
+                      }}
+                      className="cursor-pointer pointer-events-auto"
+                      title={`Jump to Epoch E${pt.epochIdx} (${pt.observation_id})`}
+                    >
+                      {/* Outer target ring */}
+                      <circle
+                        cx={pt.screenX}
+                        cy={pt.screenY}
+                        r={isActive ? 6 : 4}
+                        fill={`${trackColor}25`}
+                        stroke={trackColor}
+                        strokeWidth={0.8}
+                        strokeDasharray="2,2"
+                        vectorEffect="non-scaling-stroke"
+                      />
+                      {/* Inner waypoint center pip */}
                       <circle
                         cx={pt.screenX}
                         cy={pt.screenY}
@@ -481,13 +529,15 @@ export const SkyViewer = ({
                         strokeWidth={0.8}
                         vectorEffect="non-scaling-stroke"
                       />
+                      {/* Waypoint label showing Epoch index E1, E2, E3 */}
                       <text
-                        x={pt.screenX + 5}
+                        x={pt.screenX + 7}
                         y={pt.screenY - 4}
                         fill={isActive ? trackColor : "#94a3b8"}
                         fontSize={9}
                         fontFamily="monospace"
-                        className="select-none drop-shadow"
+                        fontWeight="bold"
+                        className="select-none drop-shadow pointer-events-none"
                       >
                         E{pt.epochIdx}
                       </text>
@@ -831,6 +881,55 @@ export const SkyViewer = ({
                 </g>
               );
             })}
+
+          {/* 5. Persistent Target Lock when selected source has a detection dropout in current epoch */}
+          {selectedSource?.isDropoutTarget && (() => {
+            const coords = getEpochScreenCoords(selectedSource);
+            if (!coords) return null;
+            return (
+              <g className="pointer-events-none">
+                <circle
+                  cx={coords.x}
+                  cy={coords.y}
+                  r={18}
+                  fill="none"
+                  stroke="#f59e0b"
+                  strokeWidth={1.5}
+                  strokeDasharray="4,4"
+                  vectorEffect="non-scaling-stroke"
+                />
+                <line
+                  x1={coords.x - 12}
+                  y1={coords.y}
+                  x2={coords.x + 12}
+                  y2={coords.y}
+                  stroke="#f59e0b"
+                  strokeWidth={1}
+                  vectorEffect="non-scaling-stroke"
+                />
+                <line
+                  x1={coords.x}
+                  y1={coords.y - 12}
+                  x2={coords.x}
+                  y2={coords.y + 12}
+                  stroke="#f59e0b"
+                  strokeWidth={1}
+                  vectorEffect="non-scaling-stroke"
+                />
+                <text
+                  x={coords.x + 16}
+                  y={coords.y - 6}
+                  fill="#f59e0b"
+                  fontSize={10}
+                  fontFamily="monospace"
+                  fontWeight="bold"
+                  className="select-none drop-shadow"
+                >
+                  TARGET (Non-detection in this epoch)
+                </text>
+              </g>
+            );
+          })()}
 
 
         </svg>

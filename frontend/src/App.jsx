@@ -135,7 +135,7 @@ export const App = () => {
         const track = await api.createTrackTask({
           referenceObsId: startingEpochId,
           referenceSourceId: src.id,
-          matchingRadiusArcsec: 45.0
+          matchingRadiusArcsec: 15.0
         });
 
         // Ignore if another task superseded
@@ -323,10 +323,6 @@ export const App = () => {
       if (associatedTrack) {
         setActiveTrackId(associatedTrack.track_id);
         setTrackData(associatedTrack);
-      } else {
-        // If clicking an unassociated source, clear active track context to avoid stale display
-        setActiveTrackId(null);
-        setTrackData(null);
       }
     },
     [activeObservationId, tracks]
@@ -447,23 +443,84 @@ export const App = () => {
             const detected = (res.sources || []).filter((s) => !excludedSourceIds.has(s.id));
             setSources(detected);
 
-            // Maintain tracked object association across epochs using tracking service associations
+            // Maintain tracked object association across epochs
             const currentTrack = (activeTrackId && tracks[activeTrackId]) || trackData;
             if (currentTrack?.timeline) {
               const epMatch = currentTrack.timeline.find((ep) => ep.observation_id === activeObservationId);
-              // Only confirmed/accepted detections associated with the track are selected
               if (epMatch?.is_measured && epMatch.status === "Likely match" && epMatch.matched_source_id) {
                 const matched = detected.find((s) => s.id === epMatch.matched_source_id);
                 setSelectedSource(matched || null);
+              } else if (epMatch?.status === "Ambiguous match") {
+                // Keep target lock active for review
+                setSelectedSource({
+                  id: `${currentTrack.display_name || currentTrack.track_id} [AMBIGUOUS REVIEW]`,
+                  isAmbiguousTarget: true,
+                  ra_deg: epMatch.predicted_ra_deg || epMatch.ra_deg,
+                  dec_deg: epMatch.predicted_dec_deg || epMatch.dec_deg,
+                  pixel_x: epMatch.pixel_x,
+                  pixel_y: epMatch.pixel_y,
+                  candidate_count: epMatch.candidate_count || 2,
+                  status_note: "Ambiguous: Multiple candidates in this epoch. Review in Inspector."
+                });
+              } else if (epMatch?.status === "Not detected") {
+                // Detection dropout: maintain target lock at predicted position
+                setSelectedSource({
+                  id: `${currentTrack.display_name || currentTrack.track_id} [NON-DETECTION]`,
+                  isDropoutTarget: true,
+                  ra_deg: epMatch.predicted_ra_deg,
+                  dec_deg: epMatch.predicted_dec_deg,
+                  pixel_x: epMatch.pixel_x,
+                  pixel_y: epMatch.pixel_y,
+                  upper_limit_3sigma: epMatch.upper_limit_3sigma,
+                  status_note: "Target below detection threshold in this epoch (upper limit recorded)."
+                });
               } else {
-                // When target is not detected, outside FOV, or ambiguous in this observation:
-                // Strictly do NOT create a fake detection or display predicted position as an observed source
                 setSelectedSource(null);
               }
             } else if (trackedTargetRef.current) {
-              if (trackedTargetRef.current.obsId !== activeObservationId) {
+              // Maintain target lock for user-selected star across epoch transitions
+              const targetRa = trackedTargetRef.current.ra;
+              const targetDec = trackedTargetRef.current.dec;
+              if (targetRa != null && targetDec != null) {
+                // Search for matching detection within 8.0 arcseconds (~1.3 SPHEREx pixels)
+                let bestMatch = null;
+                let minSep = 8.0 / 3600.0;
+                for (const s of detected) {
+                  if (s.ra_deg != null && s.dec_deg != null) {
+                    const dRa = (s.ra_deg - targetRa) * Math.cos((targetDec * Math.PI) / 180);
+                    const dDec = s.dec_deg - targetDec;
+                    const sepDeg = Math.sqrt(dRa * dRa + dDec * dDec);
+                    if (sepDeg < minSep) {
+                      minSep = sepDeg;
+                      bestMatch = s;
+                    }
+                  }
+                }
+                if (bestMatch) {
+                  // Found the exact same star in the new epoch! Keep it selected!
+                  setSelectedSource(bestMatch);
+                  trackedTargetRef.current = {
+                    id: bestMatch.id,
+                    obsId: activeObservationId,
+                    ra: bestMatch.ra_deg,
+                    dec: bestMatch.dec_deg,
+                    pixelX: bestMatch.pixel_x,
+                    pixelY: bestMatch.pixel_y
+                  };
+                } else {
+                  // Target dropout in this epoch: keep target lock at J2000 coordinates
+                  setSelectedSource({
+                    id: `Target (Dropout in this epoch)`,
+                    isDropoutTarget: true,
+                    ra_deg: targetRa,
+                    dec_deg: targetDec,
+                    peak_flux: 0,
+                    snr: 0,
+                    status_note: "No detection above threshold at target coordinates in this observation."
+                  });
+                }
+              } else {
                 setSelectedSource(null);
-                trackedTargetRef.current = null;
               }
             }
           }
@@ -614,6 +671,7 @@ export const App = () => {
           trackData={trackData}
           predictionData={predictionData}
           centerTarget={centerTarget}
+          onSelectObservation={handleSelectObservation}
         />
       ) : (
         <ComparisonViewer

@@ -10,7 +10,7 @@ from app.services.known_objects_service import known_objects_service
 from app.services.trajectory_service import trajectory_service
 from app.services.source_detection import source_detection_service
 from app.schemas.tracking import TrackSourceTaskRequest
-from tests.test_trajectory_service import create_custom_test_fits
+from backend.tests.test_trajectory_service import create_custom_test_fits
 
 @pytest.fixture
 def sample_known_objects_obs(tmp_path):
