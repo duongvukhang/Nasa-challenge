@@ -8,6 +8,7 @@ from app.services.spectrum_service import spectrum_service, SpectralExtractionRe
 from app.services.coordinate_service import coordinate_service
 from app.services.difference_service import difference_service
 from app.services.known_objects_service import known_objects_service
+from app.services.trajectory_service import trajectory_service
 from app.schemas.observation import (
     ObservationMetadata,
     SourceListResponse,
@@ -88,6 +89,17 @@ def get_detected_sources(
         fwhm_pixels=fwhm_pixels,
         max_sources=max_sources
     )
+    active_tracks = trajectory_service.list_tracks()
+    if active_tracks:
+        track_map = {
+            ep.matched_source_id: (trk.track_id, trk.display_name or trk.track_id)
+            for trk in active_tracks
+            for ep in trk.timeline
+            if ep.observation_id == observation_id and ep.matched_source_id and ep.is_measured
+        }
+        for src in res.sources:
+            if src.id in track_map:
+                src.object_id, src.persistent_label = track_map[src.id]
     return res
 
 @router.get("/{observation_id}/spectrum", response_model=SpectralExtractionResponse)

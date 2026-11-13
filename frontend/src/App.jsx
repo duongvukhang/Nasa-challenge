@@ -123,18 +123,19 @@ export const App = () => {
     async (src) => {
       if (!src || !activeObservationId) return;
 
-      // 1. Preserve source ID, starting epoch ID (E0), coordinates, uncertainty
-      const startingEpochId = activeObservationId;
+      // 1. Preserve origin reference source ID and starting epoch ID
+      const startingEpochId = src.origin_observation_id || trackedTargetRef.current?.originObsId || activeObservationId;
+      const refSourceId = src.origin_source_id || trackedTargetRef.current?.originSourceId || src.id;
       const currentTaskId = ++trackingTaskIdRef.current;
       setIsTrackingLoading(true);
 
-      showToast(`Tracking source ${src.id} across loaded epochs...`, "info");
+      showToast(`Tracking source ${refSourceId} across loaded epochs...`, "info");
 
       try {
         // 2-5. Execute scientific multi-epoch trajectory tracking
         const track = await api.createTrackTask({
           referenceObsId: startingEpochId,
-          referenceSourceId: src.id,
+          referenceSourceId: refSourceId,
           matchingRadiusArcsec: 15.0
         });
 
@@ -303,19 +304,28 @@ export const App = () => {
         return;
       }
 
-      setSelectedSource(src);
+      const srcWithOrigin = {
+        ...src,
+        origin_observation_id: src.origin_observation_id || activeObservationId,
+        origin_source_id: src.origin_source_id || src.id
+      };
+
+      setSelectedSource(srcWithOrigin);
       trackedTargetRef.current = {
         id: src.id,
         obsId: activeObservationId,
+        originObsId: srcWithOrigin.origin_observation_id,
+        originSourceId: srcWithOrigin.origin_source_id,
         ra: src.ra_deg,
         dec: src.dec_deg,
         pixelX: src.pixel_x,
         pixelY: src.pixel_y
       };
 
-      // Check if this source belongs to an existing active track in the current observation
+      // Check if this source belongs to an existing active track
       const trackList = Object.values(tracks);
       const associatedTrack = trackList.find((tr) => {
+        if (tr.reference_source_id === src.id || tr.reference_source_id === srcWithOrigin.origin_source_id) return true;
         const ep = tr?.timeline?.find((e) => e.observation_id === activeObservationId);
         return ep?.is_measured && ep?.matched_source_id === src.id && ep?.status === "Likely match";
       });
@@ -331,15 +341,33 @@ export const App = () => {
   // Determine the active track associated with the selected source in the current observation
   const selectedSourceTrack = useMemo(() => {
     if (!activeObservationId) return null;
+    const trackList = Object.values(tracks);
     if (selectedSource) {
-      const trackList = Object.values(tracks);
+      // 1. Direct match on active epoch
       for (const tr of trackList) {
         const epMatch = tr?.timeline?.find((ep) => ep.observation_id === activeObservationId);
         if (epMatch?.is_measured && epMatch.matched_source_id === selectedSource.id && epMatch.status === "Likely match") {
           return tr;
         }
       }
-      return null;
+      // 2. Persistent match in ANY epoch or by reference/origin source ID
+      for (const tr of trackList) {
+        if (
+          tr.reference_source_id === selectedSource.id ||
+          tr.reference_source_id === selectedSource.origin_source_id ||
+          tr?.timeline?.some(
+            (ep) =>
+              ep.matched_source_id &&
+              (ep.matched_source_id === selectedSource.id || ep.matched_source_id === selectedSource.origin_source_id)
+          )
+        ) {
+          return tr;
+        }
+      }
+      // 3. Fallback for ambiguous or dropout target of active track
+      if ((selectedSource.isAmbiguousTarget || selectedSource.isDropoutTarget) && activeTrackId && tracks[activeTrackId]) {
+        return tracks[activeTrackId];
+      }
     }
     return activeTrackId && tracks[activeTrackId] ? tracks[activeTrackId] : trackData;
   }, [selectedSource, activeObservationId, tracks, activeTrackId, trackData]);
@@ -449,12 +477,24 @@ export const App = () => {
               const epMatch = currentTrack.timeline.find((ep) => ep.observation_id === activeObservationId);
               if (epMatch?.is_measured && epMatch.status === "Likely match" && epMatch.matched_source_id) {
                 const matched = detected.find((s) => s.id === epMatch.matched_source_id);
-                setSelectedSource(matched || null);
+                if (matched) {
+                  setSelectedSource({
+                    ...matched,
+                    origin_observation_id: currentTrack.reference_observation_id,
+                    origin_source_id: currentTrack.reference_source_id
+                  });
+                } else {
+                  setSelectedSource(null);
+                }
               } else if (epMatch?.status === "Ambiguous match") {
-                // Keep target lock active for review
+                // Keep target lock active for review without corrupting source id
                 setSelectedSource({
-                  id: `${currentTrack.display_name || currentTrack.track_id} [AMBIGUOUS REVIEW]`,
+                  id: epMatch.matched_source_id || selectedSource?.id || `ambiguous_${activeObservationId}`,
+                  display_name: `${currentTrack.display_name || currentTrack.track_id} [AMBIGUOUS REVIEW]`,
+                  status_badge: "Ambiguous match",
                   isAmbiguousTarget: true,
+                  origin_observation_id: currentTrack.reference_observation_id,
+                  origin_source_id: currentTrack.reference_source_id,
                   ra_deg: epMatch.predicted_ra_deg || epMatch.ra_deg,
                   dec_deg: epMatch.predicted_dec_deg || epMatch.dec_deg,
                   pixel_x: epMatch.pixel_x,
@@ -463,10 +503,14 @@ export const App = () => {
                   status_note: "Ambiguous: Multiple candidates in this epoch. Review in Inspector."
                 });
               } else if (epMatch?.status === "Not detected") {
-                // Detection dropout: maintain target lock at predicted position
+                // Detection dropout: maintain target lock at predicted position without corrupting source id
                 setSelectedSource({
-                  id: `${currentTrack.display_name || currentTrack.track_id} [NON-DETECTION]`,
+                  id: selectedSource?.id || `dropout_${activeObservationId}`,
+                  display_name: `${currentTrack.display_name || currentTrack.track_id} [NON-DETECTION]`,
+                  status_badge: "Not detected",
                   isDropoutTarget: true,
+                  origin_observation_id: currentTrack.reference_observation_id,
+                  origin_source_id: currentTrack.reference_source_id,
                   ra_deg: epMatch.predicted_ra_deg,
                   dec_deg: epMatch.predicted_dec_deg,
                   pixel_x: epMatch.pixel_x,
@@ -482,9 +526,9 @@ export const App = () => {
               const targetRa = trackedTargetRef.current.ra;
               const targetDec = trackedTargetRef.current.dec;
               if (targetRa != null && targetDec != null) {
-                // Search for matching detection within 8.0 arcseconds (~1.3 SPHEREx pixels)
+                // Search for matching detection: generous radius (45 arcsec) to catch movers across epochs
                 let bestMatch = null;
-                let minSep = 8.0 / 3600.0;
+                let minSep = 45.0 / 3600.0;
                 for (const s of detected) {
                   if (s.ra_deg != null && s.dec_deg != null) {
                     const dRa = (s.ra_deg - targetRa) * Math.cos((targetDec * Math.PI) / 180);
@@ -497,21 +541,32 @@ export const App = () => {
                   }
                 }
                 if (bestMatch) {
-                  // Found the exact same star in the new epoch! Keep it selected!
-                  setSelectedSource(bestMatch);
+                  // Found the source in the new epoch! Keep it selected!
+                  const srcWithOrigin = {
+                    ...bestMatch,
+                    origin_observation_id: trackedTargetRef.current.originObsId || trackedTargetRef.current.obsId,
+                    origin_source_id: trackedTargetRef.current.originSourceId || trackedTargetRef.current.id
+                  };
+                  setSelectedSource(srcWithOrigin);
                   trackedTargetRef.current = {
                     id: bestMatch.id,
                     obsId: activeObservationId,
+                    originObsId: srcWithOrigin.origin_observation_id,
+                    originSourceId: srcWithOrigin.origin_source_id,
                     ra: bestMatch.ra_deg,
                     dec: bestMatch.dec_deg,
                     pixelX: bestMatch.pixel_x,
                     pixelY: bestMatch.pixel_y
                   };
                 } else {
-                  // Target dropout in this epoch: keep target lock at J2000 coordinates
+                  // Target dropout in this epoch: keep target lock at J2000 coordinates without corrupting source id
                   setSelectedSource({
-                    id: `Target (Dropout in this epoch)`,
+                    id: trackedTargetRef.current.id,
+                    display_name: "Target (Dropout in this epoch)",
+                    status_badge: "Dropout in this epoch",
                     isDropoutTarget: true,
+                    origin_observation_id: trackedTargetRef.current.originObsId || trackedTargetRef.current.obsId,
+                    origin_source_id: trackedTargetRef.current.originSourceId || trackedTargetRef.current.id,
                     ra_deg: targetRa,
                     dec_deg: targetDec,
                     peak_flux: 0,

@@ -188,12 +188,16 @@ export const SkyViewer = ({
 
       if (map.has(currentEp.matched_source_id)) {
         const existing = map.get(currentEp.matched_source_id);
-        existing.hasConflict = true;
-        existing.conflictingTracks = existing.conflictingTracks || [existing.track];
-        existing.conflictingTracks.push(tr);
-        existing.persistentLabel = `${existing.persistentLabel} / ${persistentLabel} [CONFLICT]`;
-        existing.isConfirmed = false;
-        existing.isAmbiguous = true;
+        if (existing.track.track_id !== tr.track_id) {
+          existing.hasConflict = true;
+          existing.conflictingTracks = existing.conflictingTracks || [existing.track];
+          if (!existing.conflictingTracks.some((t) => t.track_id === tr.track_id)) {
+            existing.conflictingTracks.push(tr);
+          }
+          existing.persistentLabel = `${existing.persistentLabel} / ${persistentLabel} [CONFLICT]`;
+          existing.isConfirmed = false;
+          existing.isAmbiguous = true;
+        }
       } else {
         map.set(currentEp.matched_source_id, {
           track: tr,
@@ -242,14 +246,11 @@ export const SkyViewer = ({
         const mapping = {};
         res.projected.forEach((p) => {
           const scopedKey = `${observation.observation_id}:${p.ra_deg.toFixed(6)},${p.dec_deg.toFixed(6)}`;
-          const plainKey = `${p.ra_deg.toFixed(6)},${p.dec_deg.toFixed(6)}`;
-          const pos = {
+          mapping[scopedKey] = {
             x: p.pixel_x,
             y: imgH - p.pixel_y,
             inside: p.inside_bounds
           };
-          mapping[scopedKey] = pos;
-          mapping[plainKey] = pos;
         });
         setProjectedCoordsMap((prev) => ({ ...prev, ...mapping }));
       })
@@ -291,10 +292,6 @@ export const SkyViewer = ({
       const scopedKey = `${observation.observation_id}:${ep.ra_deg.toFixed(6)},${ep.dec_deg.toFixed(6)}`;
       if (projectedCoordsMap[scopedKey]) {
         return projectedCoordsMap[scopedKey];
-      }
-      const plainKey = `${ep.ra_deg.toFixed(6)},${ep.dec_deg.toFixed(6)}`;
-      if (projectedCoordsMap[plainKey]) {
-        return projectedCoordsMap[plainKey];
       }
     }
 
@@ -435,20 +432,34 @@ export const SkyViewer = ({
             const trackColor = tr.color || getStableTrackColor(tr.track_id);
             const isActive = tr.track_id === activeTrackId;
 
-            // Extract measured waypoints reprojected into current field (strictly confirmed matches)
+            // Extract waypoints reprojected into current field (confirmed matches & provisional/predicted epochs)
             // Sorted chronologically by MJD so lines connect Epoch A -> Epoch B -> Epoch C in proper order
             const waypoints = (tr.timeline || [])
               .map((ep, originalIdx) => ({ ep, originalIdx }))
-              .filter(({ ep }) => ep.is_measured && (ep.status === "Likely match" || ep.status === "LIKELY_MATCH"))
+              .filter(
+                ({ ep }) =>
+                  (ep.is_measured && (ep.status === "Likely match" || ep.status === "LIKELY_MATCH")) ||
+                  ep.predicted_ra_deg != null ||
+                  ep.ra_deg != null
+              )
               .sort((a, b) => (a.ep.mjd_obs || 0) - (b.ep.mjd_obs || 0))
               .map(({ ep, originalIdx }) => {
-                const coords = getEpochScreenCoords(ep);
+                const isConfirmed = ep.is_measured && (ep.status === "Likely match" || ep.status === "LIKELY_MATCH");
+                const ptCoords = isConfirmed
+                  ? ep
+                  : {
+                      ...ep,
+                      ra_deg: ep.ra_deg ?? ep.predicted_ra_deg,
+                      dec_deg: ep.dec_deg ?? ep.predicted_dec_deg
+                    };
+                const coords = getEpochScreenCoords(ptCoords);
                 if (!coords) return null;
                 return {
                   ...ep,
                   epochIdx: originalIdx + 1,
                   screenX: coords.x,
                   screenY: coords.y,
+                  isConfirmed,
                   isCurrent: ep.observation_id === observation?.observation_id
                 };
               })
@@ -462,6 +473,7 @@ export const SkyViewer = ({
                 {waypoints.map((pt, idx) => {
                   if (idx === 0) return null;
                   const prev = waypoints[idx - 1];
+                  const isSegmentConfirmed = prev.isConfirmed && pt.isConfirmed;
 
                   return (
                     <g key={`traj_seg_${tr.track_id}_${idx}`} className="pointer-events-none">
@@ -471,20 +483,21 @@ export const SkyViewer = ({
                         y1={prev.screenY}
                         x2={pt.screenX}
                         y2={pt.screenY}
-                        stroke={trackColor}
+                        stroke={isSegmentConfirmed ? trackColor : "#f59e0b"}
                         strokeWidth={isActive ? 3.5 : 2.5}
-                        strokeOpacity={isActive ? 0.35 : 0.2}
+                        strokeOpacity={isSegmentConfirmed ? (isActive ? 0.35 : 0.2) : 0.25}
                         vectorEffect="non-scaling-stroke"
                       />
-                      {/* Crisp directional trajectory vector line with arrowhead */}
+                      {/* Crisp directional trajectory vector line with arrowhead (dashed amber if provisional) */}
                       <line
                         x1={prev.screenX}
                         y1={prev.screenY}
                         x2={pt.screenX}
                         y2={pt.screenY}
-                        stroke={trackColor}
+                        stroke={isSegmentConfirmed ? trackColor : "#f59e0b"}
                         strokeWidth={isActive ? 2 : 1.5}
-                        strokeOpacity={isActive ? 1.0 : 0.85}
+                        strokeOpacity={isSegmentConfirmed ? (isActive ? 1.0 : 0.85) : 0.7}
+                        strokeDasharray={isSegmentConfirmed ? undefined : "5,4"}
                         markerEnd={`url(#trajArrow_${tr.track_id})`}
                         vectorEffect="non-scaling-stroke"
                       />

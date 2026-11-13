@@ -96,6 +96,16 @@ def test_persistent_identity_across_three_observations(tmp_path):
     assert ep2_match.status == MatchStatus.LIKELY_MATCH
     assert ep3_match.status == MatchStatus.LIKELY_MATCH
 
+    # Tracking from epoch 2 reuses the persistent track and avoids conflicting duplicate tracks
+    track_from_ep2 = trajectory_service.track_source(TrackSourceTaskRequest(
+        reference_observation_id="obs_ep2",
+        reference_source_id=id2,
+        matching_radius_arcsec=45.0
+    ))
+    assert track_from_ep2.track_id == track.track_id
+    assert track_from_ep2.display_name == track.display_name
+    assert len(trajectory_service.list_tracks()) == 1
+
 @pytest.mark.synthetic
 def test_unrelated_sources_retain_distinct_identities(tmp_path):
     """

@@ -69,6 +69,8 @@ class DetectedSource(BaseModel):
     flags: int = 0
     is_saturated: bool = False
     provenance: str = "photutils_detection"
+    object_id: Optional[str] = None
+    persistent_label: Optional[str] = None
 
 class SourceListResponse(BaseModel):
     observation_id: str

@@ -240,6 +240,8 @@ class TrajectoryService:
     def list_tracks(self) -> List[MultiEpochTrack]:
         return list(self._tracks.values())
 
+    get_all_tracks = list_tracks
+
     def get_track(self, track_id: str) -> Optional[MultiEpochTrack]:
         return self._tracks.get(track_id)
 
@@ -381,6 +383,20 @@ class TrajectoryService:
             raise ValueError(f"Starting epoch observation '{req.reference_observation_id}' not found.")
 
         ref_meta: ObservationMetadata = ref_obs_record["metadata"]
+
+        # Check if reference detection is already confirmed in an existing track
+        if not req.track_id:
+            for trk in self._tracks.values():
+                for ep in trk.timeline:
+                    if (
+                        ep.observation_id == req.reference_observation_id
+                        and ep.matched_source_id == req.reference_source_id
+                        and ep.is_measured
+                        and ep.status == MatchStatus.LIKELY_MATCH
+                    ):
+                        if req.display_name:
+                            trk.display_name = req.display_name
+                        return trk
 
         track_id = req.track_id or f"trk_{req.reference_observation_id}_{req.reference_source_id}"
         color = get_stable_track_color(track_id)

@@ -41,7 +41,7 @@ export const SelectedObjectManager = ({
           <div>
             <div className="flex items-center space-x-1.5">
               <span className="font-bold text-white tracking-wide">
-                {activeTrack ? (activeTrack.display_name || activeTrack.track_id) : selectedSource.id}
+                {activeTrack ? (activeTrack.display_name || activeTrack.track_id) : selectedSource.persistent_label || selectedSource.display_name || selectedSource.id}
               </span>
               {activeTrack && (
                 <span className="px-1.5 py-0.2 rounded text-[9px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30" title="Detection ID">
